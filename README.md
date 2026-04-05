@@ -139,7 +139,7 @@ Anthropic uses two mechanisms to detect third-party tools:
 
    If detected, the response is refused with `stop_reason: "refusal"` or a billing error.
 
-**What is NOT detected:** Assistant names (e.g., "Vegeta"), workspace filenames (AGENTS.md, SOUL.md), config paths (.openclaw/), plugin names (lossless-claw), individual tool names, or any other OpenClaw-specific terms. Only the 7 patterns above trigger rejection.
+**What is NOT detected:** Assistant names, workspace filenames (AGENTS.md, SOUL.md), config paths (.openclaw/), plugin names (lossless-claw), individual tool names, or any other OpenClaw-specific terms. Only the 7 patterns above trigger rejection.
 
 This proxy addresses both mechanisms with the billing header injection and 7 string replacements.
 
