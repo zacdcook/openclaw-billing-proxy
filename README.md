@@ -200,6 +200,54 @@ Without reverse mapping, the model sees sanitized paths in its context (e.g., `.
 - File paths match the actual filesystem
 - Session management commands use correct identifiers
 
+## Troubleshooting
+
+Run the diagnostic script to identify issues:
+
+```bash
+node troubleshoot.js
+```
+
+This tests 8 layers independently (credentials, token, API, billing header, trigger detection, proxy health, end-to-end) and tells you exactly what to fix.
+
+### Common Issues
+
+**"Could not find credentials file"**
+- Run `claude auth login` to authenticate (opens browser)
+- On Mac, the file may be at `~/.claude/credentials.json` (no dot prefix) -- the proxy checks both
+- If the file exists but is empty (0 bytes), run `claude auth logout && claude auth login`
+- If still empty on Mac, run `claude -p "test" --max-turns 1` to force a credential write to disk
+
+**Proxy returns 400**
+- The API is rejecting the request due to unsanitized trigger terms
+- Your OpenClaw version may have `sessions_*` tools not in the default list
+- Run `node setup.js` to auto-detect your tools, or manually add patterns to `config.json`
+- Check the proxy console output for the error message
+
+**"Third-party apps now draw from your extra usage"**
+- Same cause as 400 -- trigger terms not fully sanitized
+- Disable Extra Usage in your Claude settings to verify subscription billing
+- If it was working and stopped, new trigger terms may have appeared in your conversation history -- restart the OpenClaw gateway to clear the session
+
+**429 Rate Limit**
+- Normal if you have active Claude Code sessions sharing the rate bucket
+- Wait a few minutes and try again
+- Not a proxy issue
+
+**Token Expired**
+- Open Claude Code CLI briefly -- it auto-refreshes on startup
+- Or run: `claude -p "ping" --max-turns 1 --no-session-persistence`
+
+**Tool execution fails / wrong file paths**
+- If the model references `.ocplatform/` instead of `.openclaw/`, your `reverseMap` is missing entries
+- Ensure every `replacements` entry has a matching `reverseMap` entry
+- Use space-free replacements (e.g., `ocplatform`, NOT `assistant platform`) to avoid breaking filesystem paths
+
+**Empty credentials file on Mac**
+- Some Claude Code versions store tokens in macOS Keychain instead of a file
+- Run `claude -p "test" --max-turns 1` to force credential write
+- Check Keychain: `security find-generic-password -s "claude" -w 2>/dev/null`
+
 ## Rollback
 
 Change `baseUrl` back to `https://api.anthropic.com` in `openclaw.json` and restart the gateway. Enable Extra Usage in your Claude settings if needed.
