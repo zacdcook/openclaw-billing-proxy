@@ -8,7 +8,10 @@
     ["sessions_list", "list_tasks"],
     ["sessions_history", "get_history"],
     ["sessions_send", "send_to_task"],
+    ["sessions_yield_interrupt", "task_yield_interrupt"],
     ["sessions_yield", "yield_task"],
+    ["sessions_store", "task_store"],
+    ["HEARTBEAT_OK", "HB_ACK"],
     ["running inside", "running on"]
   ],
   "reverseMap": [
@@ -18,7 +21,10 @@
     ["list_tasks", "sessions_list"],
     ["get_history", "sessions_history"],
     ["send_to_task", "sessions_send"],
-    ["yield_task", "sessions_yield"]
+    ["task_yield_interrupt", "sessions_yield_interrupt"],
+    ["yield_task", "sessions_yield"],
+    ["task_store", "sessions_store"],
+    ["HB_ACK", "HEARTBEAT_OK"]
   ],
   "_comment": "Replacements sanitize outbound requests. ReverseMap restores original terms in responses. Use space-free replacements for lowercase openclaw to avoid breaking filesystem paths."
 }

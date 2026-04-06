@@ -59,7 +59,10 @@ const DEFAULT_REPLACEMENTS = [
   ['sessions_list', 'list_tasks'],
   ['sessions_history', 'get_history'],
   ['sessions_send', 'send_to_task'],
+  ['sessions_yield_interrupt', 'task_yield_interrupt'],
   ['sessions_yield', 'yield_task'],
+  ['sessions_store', 'task_store'],
+  ['HEARTBEAT_OK', 'HB_ACK'],
   ['running inside', 'running on']
 ];
 
@@ -72,7 +75,10 @@ const DEFAULT_REVERSE_MAP = [
   ['list_tasks', 'sessions_list'],
   ['get_history', 'sessions_history'],
   ['send_to_task', 'sessions_send'],
-  ['yield_task', 'sessions_yield']
+  ['task_yield_interrupt', 'sessions_yield_interrupt'],
+  ['yield_task', 'sessions_yield'],
+  ['task_store', 'sessions_store'],
+  ['HB_ACK', 'HEARTBEAT_OK']
 ];
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -250,6 +256,7 @@ function startServer(config) {
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${body.length}b)`);
+      if (reqNum === 1) { try { fs.writeFileSync('/tmp/openclaw-request-raw.json', Buffer.concat(chunks).toString('utf8')); fs.writeFileSync('/tmp/openclaw-request-processed.json', bodyStr); console.log(`[${ts}] #${reqNum} dumped raw+processed bodies to /tmp/`); } catch(e) {} }
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,

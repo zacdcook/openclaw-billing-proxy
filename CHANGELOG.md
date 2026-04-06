@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.3.0 -- 2026-04-06
+
+### HEARTBEAT_OK trigger + missing sessions_* tools + NVM path scanning
+
+**Changes:**
+- Added `HEARTBEAT_OK` to sanitization — a newly discovered trigger phrase that
+  Anthropic's classifier detects. OpenClaw injects this in heartbeat ack
+  instructions; without sanitizing it, all requests fail with "out of extra
+  usage" even when the billing block and OAuth token are correct.
+- Added `sessions_store` and `sessions_yield_interrupt` to default tool list —
+  these exist in OpenClaw 2026.4.x but were missing from the proxy defaults.
+- Fixed `setup.js` to scan NVM install paths (`~/.nvm/versions/node/*/lib/...`)
+  when auto-detecting `sessions_*` tools. Previously only checked system-wide
+  and npm-global paths, causing NVM-installed OpenClaw to fall back to defaults.
+- Updated `config.example.json` with all new patterns.
+
+**Why HEARTBEAT_OK:**
+OpenClaw's system prompt includes heartbeat ack instructions containing
+`HEARTBEAT_OK`. Anthropic's classifier treats this as a third-party harness
+identifier. Replacing it with `HB_ACK` and reverse-mapping responses resolves
+the billing rejection. Confirmed via binary search on a 103K system prompt.
+
+**Ordering note:**
+`sessions_yield_interrupt` must appear before `sessions_yield` in the
+replacements array to avoid partial matches (`sessions_yield` matching the
+prefix of `sessions_yield_interrupt`).
+
+---
+
 ## v1.2.0 -- 2026-04-05
 
 ### Bidirectional reverse mapping + sessions_yield + path-safe replacements

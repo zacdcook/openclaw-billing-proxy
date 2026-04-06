@@ -185,7 +185,8 @@ Anthropic uses two mechanisms to detect third-party tools:
 
 2. **Streaming Classifier** -- Anthropic's classifier scans the request for specific trigger phrases. The verified triggers are:
    - `OpenClaw` (the platform name -- case insensitive)
-   - `sessions_spawn`, `sessions_list`, `sessions_history`, `sessions_send`, `sessions_yield` (OpenClaw session management tools -- new tools are added across versions)
+   - `sessions_spawn`, `sessions_list`, `sessions_history`, `sessions_send`, `sessions_yield`, `sessions_yield_interrupt`, `sessions_store` (OpenClaw session management tools -- new tools are added across versions)
+   - `HEARTBEAT_OK` (OpenClaw heartbeat ack identifier injected in system prompt)
    - `running inside` + platform name (the self-declaration phrase OpenClaw injects)
 
    If detected, the response is refused with `stop_reason: "refusal"` or a billing error.

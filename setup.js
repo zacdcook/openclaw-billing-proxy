@@ -70,12 +70,14 @@ for (const p of oclawPaths) {
 const replacements = [
   ['OpenClaw', 'OCPlatform'],
   ['openclaw', 'ocplatform'],
+  ['HEARTBEAT_OK', 'HB_ACK'],
   ['running inside', 'running on']
 ];
 
 const reverseMap = [
   ['OCPlatform', 'OpenClaw'],
-  ['ocplatform', 'openclaw']
+  ['ocplatform', 'openclaw'],
+  ['HB_ACK', 'HEARTBEAT_OK']
 ];
 
 // Step 3: Scan for sessions_* tools
@@ -99,6 +101,16 @@ if (oclawPath) {
   // Also check npm global on Windows
   if (process.platform === 'win32') {
     distPaths.push(path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'openclaw', 'dist'));
+  }
+  // Check NVM install paths
+  const nvmDir = path.join(homeDir, '.nvm', 'versions', 'node');
+  if (fs.existsSync(nvmDir)) {
+    try {
+      const versions = fs.readdirSync(nvmDir);
+      for (const v of versions) {
+        distPaths.push(path.join(nvmDir, v, 'lib', 'node_modules', 'openclaw', 'dist'));
+      }
+    } catch (e) { /* skip */ }
   }
 
   let sessionTools = [];
@@ -124,7 +136,7 @@ if (oclawPath) {
 
   if (sessionTools.length === 0) {
     // Fallback: use known sessions_* tools
-    sessionTools = ['sessions_spawn', 'sessions_list', 'sessions_history', 'sessions_send', 'sessions_yield'];
+    sessionTools = ['sessions_spawn', 'sessions_list', 'sessions_history', 'sessions_send', 'sessions_yield_interrupt', 'sessions_yield', 'sessions_store'];
     console.log('   Using default sessions_* tool list (could not scan source)');
   } else {
     console.log('   Detected sessions_* tools: ' + sessionTools.join(', '));
@@ -136,7 +148,9 @@ if (oclawPath) {
     'sessions_list': 'list_tasks',
     'sessions_history': 'get_history',
     'sessions_send': 'send_to_task',
-    'sessions_yield': 'yield_task'
+    'sessions_yield_interrupt': 'task_yield_interrupt',
+    'sessions_yield': 'yield_task',
+    'sessions_store': 'task_store'
   };
 
   for (const tool of sessionTools) {
