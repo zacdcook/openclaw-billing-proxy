@@ -75,7 +75,7 @@ for (const p of credsPaths) {
 if (!credsPath && process.platform === 'darwin') {
   info('No credential files found. Checking macOS Keychain...');
   const { execSync } = require('child_process');
-  const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
   for (const svc of keychainNames) {
     try {
       const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
@@ -108,7 +108,7 @@ if (!credsPath || !creds) {
   info('');
   info('Searched files: ' + credsPaths.join(', '));
   if (process.platform === 'darwin') {
-    info('Searched Keychain: claude-code, claude, com.anthropic.claude-code');
+    info('Searched Keychain: Claude Code-credentials, claude-code, claude, com.anthropic.claude-code');
   }
   info('');
   info('To fix:');

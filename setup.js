@@ -50,7 +50,7 @@ if (!creds && process.platform === 'darwin') {
   const { execSync } = require('child_process');
 
   // Try common Keychain service names
-  const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
   let keychainToken = null;
 
   for (const svc of keychainNames) {
@@ -138,7 +138,7 @@ if (!creds) {
   console.error('   Searched for credentials at:');
   for (const p of credsPaths) { console.error('     ' + p); }
   if (process.platform === 'darwin') {
-    console.error('     macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+    console.error('     macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code)');
   }
   console.error('');
   console.error('   If claude auth status shows you are logged in but no file exists,');

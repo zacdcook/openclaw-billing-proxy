@@ -6,7 +6,7 @@ Route your OpenClaw API requests through your Claude Max/Pro subscription instea
 
 After Anthropic revoked subscription billing for third-party tools (April 4, 2026), OpenClaw requests are billed to Extra Usage. This proxy sits between OpenClaw and the Anthropic API, injecting Claude Code's billing identifier so requests use your existing subscription.
 
-**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw.**
+**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw. Real-time usage dashboard.**
 
 ## How It Works
 
@@ -160,6 +160,45 @@ timeout /t 2 /nobreak >nul
 ```bash
 pm2 start proxy.js --name openclaw-proxy
 pm2 save
+```
+
+## Dashboard
+
+When running in a terminal, the proxy displays a real-time dashboard:
+
+```
+  OpenClaw Billing Proxy        Port: 18801   Uptime: 2h 14m
+  Sub: max            Token: 4.2h remaining
+  Rate: [████████████░░░░░░░░] 62%  49,500 / 80,000 remaining  resets 14:32:00
+  ──────────────────────────────────────────────────────────────────
+                                   Input        Output
+  Today (2026-04-06)              154,320        48,210   (37)
+  Yesterday                       210,500        61,000   (52)
+  ──────────────────────────────────────────────────────────────────
+  RECENT ACTIVITY
+  S [14:32:07] #37 POST /v1/messages 200  ↑1,204  ↓389
+  O [14:31:55] #36 POST /v1/messages 200  ↑980    ↓201
+```
+
+- **Rate bar** -- API rate window utilization from response headers (green/yellow/red)
+- **Token table** -- Daily input/output token totals with up to 7 days of history
+- **Recent activity** -- Last 10 requests with model tag (S/H/O = Sonnet/Haiku/Opus), status, and token counts (↑ in, ↓ out)
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `i` | Toggle info screen (explains every element) |
+| `q` | Quit the proxy |
+
+When stdout is not a TTY (e.g., piped or running as a service), the proxy falls back to plain text logging.
+
+### Usage Data
+
+Token usage is persisted to `./data/usage.json` and survives restarts. The file is updated with a 2-second debounce after each request and flushed on shutdown.
+
+```bash
+cat data/usage.json   # view raw usage data
 ```
 
 ## Token Refresh
