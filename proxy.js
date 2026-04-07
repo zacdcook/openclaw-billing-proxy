@@ -88,7 +88,13 @@ function loadConfig() {
   let port = DEFAULT_PORT;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
+    if (args[i] === '--port' && args[i + 1]) {
+      port = parseInt(args[i + 1], 10);
+      if (isNaN(port) || port < 1 || port > 65535) {
+        console.error('[ERROR] Invalid port: ' + args[i + 1] + '. Must be 1-65535.');
+        process.exit(1);
+      }
+    }
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
   }
 
@@ -118,11 +124,11 @@ function loadConfig() {
 
   // macOS Keychain fallback: extract token and write to file
   if (!credsPath && process.platform === 'darwin') {
-    const { execSync } = require('child_process');
+    const { execFileSync } = require('child_process');
     const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
     for (const svc of keychainNames) {
       try {
-        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+        const token = execFileSync('security', ['find-generic-password', '-s', svc, '-w'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
         if (token) {
           let creds;
           try { creds = JSON.parse(token); } catch(e) {
@@ -132,8 +138,8 @@ function loadConfig() {
           }
           if (creds && creds.claudeAiOauth) {
             credsPath = path.join(homeDir, '.claude', '.credentials.json');
-            fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
-            fs.writeFileSync(credsPath, JSON.stringify(creds));
+            fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true, mode: 0o700 });
+            fs.writeFileSync(credsPath, JSON.stringify(creds), { mode: 0o600 });
             console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
             break;
           }
@@ -174,37 +180,32 @@ function getToken(credsPath) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-function processBody(bodyStr, config) {
-  let modified = bodyStr;
+const BILLING_OBJ = JSON.parse(BILLING_BLOCK);
 
+function processBody(bodyStr, config) {
   // 1. Apply sanitization -- raw string replacement preserves original JSON formatting
+  let modified = bodyStr;
   for (const [find, replace] of config.replacements) {
     modified = modified.split(find).join(replace);
   }
 
-  // 2. Inject billing block into system prompt
-  const sysArrayIdx = modified.indexOf('"system":[');
-  if (sysArrayIdx !== -1) {
-    const insertAt = sysArrayIdx + '"system":['.length;
-    modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
-  } else if (modified.includes('"system":"')) {
-    const sysStart = modified.indexOf('"system":"');
-    let i = sysStart + '"system":"'.length;
-    while (i < modified.length) {
-      if (modified[i] === '\\') { i += 2; continue; }
-      if (modified[i] === '"') break;
-      i++;
-    }
-    const sysEnd = i + 1;
-    const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
-    modified = modified.slice(0, sysStart)
-      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
-      + modified.slice(sysEnd);
-  } else {
-    modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
-  }
+  // 2. Inject billing block into system prompt using proper JSON parsing
+  try {
+    const parsed = JSON.parse(modified);
 
-  return modified;
+    if (Array.isArray(parsed.system)) {
+      parsed.system.unshift(BILLING_OBJ);
+    } else if (typeof parsed.system === 'string') {
+      parsed.system = [BILLING_OBJ, { type: 'text', text: parsed.system }];
+    } else {
+      parsed.system = [BILLING_OBJ];
+    }
+
+    return JSON.stringify(parsed);
+  } catch (e) {
+    // Fallback: if body isn't valid JSON, return sanitized string as-is
+    return modified;
+  }
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
@@ -217,6 +218,8 @@ function reverseMap(text, config) {
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+
 function startServer(config) {
   let requestCount = 0;
   const startedAt = Date.now();
@@ -238,8 +241,9 @@ function startServer(config) {
           reverseMapPatterns: config.reverseMap.length
         }));
       } catch (e) {
+        console.error('[PROXY] Health check error:', e.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', message: e.message }));
+        res.end(JSON.stringify({ status: 'error', message: 'Internal server error' }));
       }
       return;
     }
@@ -247,17 +251,29 @@ function startServer(config) {
     requestCount++;
     const reqNum = requestCount;
     const chunks = [];
+    let bodySize = 0;
 
-    req.on('data', c => chunks.push(c));
+    req.on('data', (c) => {
+      bodySize += c.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { message: 'Request body too large' } }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => {
+      if (bodySize > MAX_BODY_SIZE) return;
       let body = Buffer.concat(chunks);
 
       let oauth;
       try {
         oauth = getToken(config.credsPath);
       } catch (e) {
+        console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} Token error: ${e.message}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        res.end(JSON.stringify({ type: 'error', error: { message: 'Failed to load credentials' } }));
         return;
       }
 
@@ -293,7 +309,8 @@ function startServer(config) {
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
+        path: req.url, method: req.method, headers,
+        timeout: 120000
       }, (upRes) => {
         console.log(`[${ts}] #${reqNum} > ${upRes.statusCode}`);
 
@@ -320,11 +337,16 @@ function startServer(config) {
         }
       });
 
+      upstream.on('timeout', () => {
+        console.error(`[${ts}] #${reqNum} ERR: upstream timeout`);
+        upstream.destroy(new Error('upstream timeout'));
+      });
+
       upstream.on('error', (e) => {
         console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+          res.end(JSON.stringify({ type: 'error', error: { message: 'Upstream request failed' } }));
         }
       });
 

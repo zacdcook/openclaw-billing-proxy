@@ -47,7 +47,7 @@ for (const p of credsPaths) {
 // If no file-based credentials, try macOS Keychain
 if (!creds && process.platform === 'darwin') {
   console.log('   File credentials not found, checking macOS Keychain...');
-  const { execSync } = require('child_process');
+  const { execFileSync } = require('child_process');
 
   // Try common Keychain service names
   const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
@@ -55,7 +55,7 @@ if (!creds && process.platform === 'darwin') {
 
   for (const svc of keychainNames) {
     try {
-      keychainToken = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+      keychainToken = execFileSync('security', ['find-generic-password', '-s', svc, '-w'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
       if (keychainToken) {
         console.log('   Found token in macOS Keychain (service: ' + svc + ')');
         break;
@@ -88,8 +88,8 @@ if (!creds && process.platform === 'darwin') {
       // Write credentials to file so the proxy can read them
       credsPath = path.join(homeDir, '.claude', '.credentials.json');
       const claudeDir = path.join(homeDir, '.claude');
-      if (!fs.existsSync(claudeDir)) { fs.mkdirSync(claudeDir, { recursive: true }); }
-      fs.writeFileSync(credsPath, JSON.stringify(creds));
+      if (!fs.existsSync(claudeDir)) { fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 }); }
+      fs.writeFileSync(credsPath, JSON.stringify(creds), { mode: 0o600 });
       console.log('   Written Keychain credentials to: ' + credsPath);
       console.log('   NOTE: You may need to re-run this after token refresh (every ~24h)');
     }
@@ -99,11 +99,11 @@ if (!creds && process.platform === 'darwin') {
 // If still no credentials, try forcing a credential write via claude CLI
 if (!creds) {
   console.log('   No credentials found. Attempting to trigger credential write...');
-  const { execSync } = require('child_process');
+  const { execFileSync: execFileSyncCli } = require('child_process');
   try {
-    execSync('claude -p "ping" --max-turns 1 --no-session-persistence --output-format json 2>/dev/null', {
+    execFileSyncCli('claude', ['-p', 'ping', '--max-turns', '1', '--no-session-persistence', '--output-format', 'json'], {
       timeout: 30000,
-      stdio: 'pipe'
+      stdio: ['pipe', 'pipe', 'ignore']
     });
     // Re-check files after the CLI call
     for (const p of credsPaths) {
@@ -327,7 +327,7 @@ const config = {
 };
 
 const configPath = path.join(process.cwd(), 'config.json');
-fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
 console.log('   Written: ' + configPath);
 console.log('   Sanitization patterns: ' + replacements.length);
 console.log('   Reverse map patterns: ' + reverseMap.length);

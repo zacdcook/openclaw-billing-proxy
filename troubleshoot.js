@@ -74,11 +74,11 @@ for (const p of credsPaths) {
 // macOS Keychain fallback
 if (!credsPath && process.platform === 'darwin') {
   info('No credential files found. Checking macOS Keychain...');
-  const { execSync } = require('child_process');
+  const { execFileSync } = require('child_process');
   const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
   for (const svc of keychainNames) {
     try {
-      const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+      const token = execFileSync('security', ['find-generic-password', '-s', svc, '-w'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
       if (token) {
         ok('Token found in macOS Keychain', 'service: ' + svc);
         try {
@@ -128,7 +128,7 @@ const oauth = creds.claudeAiOauth;
 const token = oauth.accessToken;
 const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
 
-ok('Token prefix', token.substring(0, 20) + '...');
+ok('Token format', token.startsWith('sk-ant-') ? 'sk-ant-* (' + token.length + ' chars)' : 'unknown format (' + token.length + ' chars)');
 ok('Subscription', oauth.subscriptionType || 'unknown');
 
 if (expiresIn > 0) {
