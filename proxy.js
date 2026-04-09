@@ -404,13 +404,20 @@ function processBody(bodyStr, config) {
 // ─── Response Processing ────────────────────────────────────────────────────
 function reverseMap(text, config) {
   let r = text;
-  // Reverse tool names first (more specific patterns)
+  // Reverse tool names first (more specific patterns).
+  // Handle BOTH plain JSON ("name") AND escaped JSON inside string fields (\"name\").
+  // SSE input_json_delta deltas put nested JSON inside a string field
+  // (partial_json), so the inner quotes are escaped. Without the escaped variant,
+  // tool_use args like "SendMessage" never get reverted to "message" and the
+  // OpenClaw tool runtime fails with "message required".
   for (const [orig, cc] of config.toolRenames) {
     r = r.split('"' + cc + '"').join('"' + orig + '"');
+    r = r.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
   }
-  // Reverse property names
+  // Reverse property names — same dual handling
   for (const [orig, renamed] of config.propRenames) {
     r = r.split('"' + renamed + '"').join('"' + orig + '"');
+    r = r.split('\\"' + renamed + '\\"').join('\\"' + orig + '\\"');
   }
   // Reverse string replacements
   for (const [sanitized, original] of config.reverseMap) {
