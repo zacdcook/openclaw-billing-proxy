@@ -348,7 +348,7 @@ async function runTests() {
   }
 
   // ─── 9. OpenClaw Configuration Check ───────────────────────────────────────
-  console.log('\n9. Checking OpenClaw configuration...\n');
+  console.log('\n9. Checking OpenClaw configuration (optional)...\n');
 
   const ocConfigPaths = [
     path.join(os.homedir(), '.openclaw', 'openclaw.json'),
@@ -374,18 +374,13 @@ async function runTests() {
           } else if (baseUrl.includes('127.0.0.1') || baseUrl.includes('localhost')) {
             info('OpenClaw baseUrl: ' + baseUrl + ' (custom port -- make sure proxy is on that port)');
           } else {
-            fail('OpenClaw baseUrl is NOT pointing to the proxy', baseUrl);
-            info('Change models.providers.anthropic.baseUrl to "http://127.0.0.1:18801" in ' + ocPath);
-            info('Then restart the OpenClaw gateway.');
-            info('');
-            info('Note: ANTHROPIC_BASE_URL env var does NOT control OpenClaw routing.');
-            info('You must set baseUrl in openclaw.json under models.providers.anthropic.');
+            info('OpenClaw baseUrl is NOT pointing to the proxy -- ' + baseUrl);
+            info('To route through proxy, change models.providers.anthropic.baseUrl to "http://127.0.0.1:18801" in ' + ocPath);
           }
         } else {
-          fail('No baseUrl found in OpenClaw config', 'OpenClaw is using the default Anthropic API directly');
-          info('Add this to ' + ocPath + ':');
+          info('No baseUrl found in OpenClaw config -- using the default Anthropic API directly');
+          info('To route through proxy, add to ' + ocPath + ':');
           info('  "models": { "providers": { "anthropic": { "baseUrl": "http://127.0.0.1:18801" } } }');
-          info('Then restart the OpenClaw gateway.');
         }
       } catch(e) {
         info('Found ' + ocPath + ' but failed to parse: ' + e.message);
