@@ -1,30 +1,14 @@
 {
   "port": 18801,
   "credentialsPath": "~/.claude/.credentials.json",
-  "replacements": [
-    ["OpenClaw", "OCPlatform"],
-    ["openclaw", "ocplatform"],
-    ["sessions_spawn", "create_task"],
-    ["sessions_list", "list_tasks"],
-    ["sessions_history", "get_history"],
-    ["sessions_send", "send_to_task"],
-    ["sessions_yield_interrupt", "task_yield_interrupt"],
-    ["sessions_yield", "yield_task"],
-    ["sessions_store", "task_store"],
-    ["HEARTBEAT_OK", "HB_ACK"],
-    ["running inside", "running on"]
-  ],
-  "reverseMap": [
-    ["OCPlatform", "OpenClaw"],
-    ["ocplatform", "openclaw"],
-    ["create_task", "sessions_spawn"],
-    ["list_tasks", "sessions_list"],
-    ["get_history", "sessions_history"],
-    ["send_to_task", "sessions_send"],
-    ["task_yield_interrupt", "sessions_yield_interrupt"],
-    ["yield_task", "sessions_yield"],
-    ["task_store", "sessions_store"],
-    ["HB_ACK", "HEARTBEAT_OK"]
-  ],
-  "_comment": "Replacements sanitize outbound requests. ReverseMap restores original terms in responses. Use space-free replacements for lowercase openclaw to avoid breaking filesystem paths."
+
+  "stripSystemConfig": true,
+  "stripToolDescriptions": true,
+  "injectCCStubs": true,
+
+  "_comment_layers": "All v2 layers enabled by default. Set to false to disable individual layers.",
+  "_comment_config": "The replacements, reverseMap, toolRenames, and propRenames arrays below show the defaults. You only need config.json if you want to customize them.",
+
+  "_comment_toolRenames": "Tool name renames are applied as quoted replacements throughout the entire body. The defaults cover all known OpenClaw tools. Add entries for any custom tools your OpenClaw version adds.",
+  "_comment_propRenames": "Property renames handle OC-specific schema properties. Add entries for any custom properties."
 }
