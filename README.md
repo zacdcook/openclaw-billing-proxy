@@ -1,336 +1,297 @@
-# OpenClaw Subscription Billing Proxy
+# OpenClaw Billing Proxy（中文版）
 
-Route your OpenClaw API requests through your Claude Max/Pro subscription instead of Extra Usage billing.
+让 OpenClaw 使用 Claude Max/Pro 套餐内额度，而不走 Extra Usage 额外计费。
 
-## What This Does
+**零额外成本 · 完整 OpenClaw 功能 · 无需修改 OpenClaw 代码**
 
-After Anthropic revoked subscription billing for third-party tools (April 4, 2026), OpenClaw requests are billed to Extra Usage. This proxy sits between OpenClaw and the Anthropic API, injecting Claude Code's billing identifier so requests use your existing subscription.
+---
 
-**Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw.**
+## 背景
 
-## How It Works
+2026 年 4 月 4 日，Anthropic 封锁了第三方工具（包括 OpenClaw）直接使用 Claude 订阅额度。所有非 Claude Code 的请求都被路由到 Extra Usage（按量付费）。
 
-The proxy performs 7-layer bidirectional request/response processing to defeat Anthropic's multi-layer detection:
+本项目通过在 OpenClaw 和 Anthropic API 之间插入一层代理，将请求伪装成 Claude Code 会话，从而继续使用套餐内额度。
 
-**Outbound (request to API):**
-1. **Billing Header** -- Injects an 84-character Claude Code billing identifier into the system prompt
-2. **Token Swap** -- Replaces OpenClaw's auth token with your Claude Code OAuth token
-3. **String Sanitization** -- Replaces 30 trigger phrases (OpenClaw, sessions_*, HEARTBEAT, etc.)
-4. **Tool Name Bypass** -- Renames all 29 OpenClaw tool names to PascalCase Claude Code convention (e.g., `exec` -> `Bash`, `lcm_grep` -> `ContextGrep`) throughout the entire body
-5. **System Template Bypass** -- Strips ~28K of structured config sections and replaces with a ~0.5K natural prose paraphrase
-6. **Tool Description Stripping** -- Removes tool descriptions to reduce fingerprint signal
-7. **Property Renaming** -- Renames OC-specific schema properties (e.g., `session_id` -> `thread_id`)
+---
 
-**Inbound (response to OpenClaw):**
-8. **Full Reverse Mapping** -- Restores ALL original tool names, property names, file paths, and identifiers in both SSE streaming chunks and JSON responses
+## 原理
 
-This ensures Anthropic sees what looks like a Claude Code session while OpenClaw sees its original tool names, paths, and identifiers.
+Anthropic 使用**四层检测机制**识别第三方工具：
 
-## Requirements
+| 层 | 检测方式 | 本项目的对策 |
+|---|---|---|
+| **L1: Billing Header** | 检查系统提示中的 `x-anthropic-billing-header` | 注入 84 字符的 Claude Code 计费标识（含 SHA256 动态哈希） |
+| **L2: 关键词扫描** | 扫描请求体中的 ~30 个已知触发词 | 29 组全局查找替换（OpenClaw→OCPlatform 等） |
+| **L3: 工具名指纹** | 分析工具名组合，匹配 OpenClaw 的 29 个工具 | 将所有工具重命名为 PascalCase Claude Code 风格 + 注入 5 个假 CC 工具 |
+| **L4: 系统提示模板匹配** | 匹配 OpenClaw 特有的 ~28K 字符结构化段落 | 剥离配置段落，替换为 ~500 字符的自然语言 |
 
-- **Node.js** 18+
-- **Claude Max or Pro subscription**
-- **Claude Code CLI** installed and authenticated
-- **OpenClaw** installed and running
+**检测是累积评分的**——必须同时应对所有四层。
 
-### Installing Claude Code CLI (if not already installed)
+---
 
-```bash
-npm install -g @anthropic-ai/claude-code
+## 架构
+
+```
+OpenClaw
+  │
+  │ /v1/messages (Anthropic 格式)
+  ▼
+┌────────────────────────────────────┐
+│  Nginx (:443 TLS)                  │
+│  按域名/路径路由                    │
+└────────────┬───────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────┐
+│  Billing Proxy (:18804)            │
+│                                    │
+│  出站处理（7 层）：                  │
+│  1. 注入 Billing Header            │
+│  2. 替换 OAuth Token               │
+│  3. 关键词替换（29 组）             │
+│  4. 工具名 PascalCase 重命名       │
+│  5. 系统提示模板剥离               │
+│  6. 工具描述删除                   │
+│  7. 属性重命名 + 尾部消息剥离       │
+│                                    │
+│  入站处理：                         │
+│  全部反向还原（工具名/属性/关键词） │
+│  SSE 流式逐 chunk 处理             │
+└────────────┬───────────────────────┘
+             │
+             ▼
+       api.anthropic.com
+       （走套餐内额度）
 ```
 
-Then authenticate with your Claude account:
+---
+
+## 部署
+
+### 前提条件
+
+- Node.js 18+
+- Claude Max 或 Pro 订阅
+- Claude Code CLI 已安装并登录（`claude auth login`）
+- OpenClaw 正在运行
+
+### Step 1: 安装
 
 ```bash
-claude auth login
-```
-
-This opens a browser window to sign in with your Claude Max/Pro account. Once authenticated, credentials are stored at `~/.claude/.credentials.json`. The proxy reads from this file.
-
-Verify it worked:
-
-```bash
-claude auth status
-# Should show: loggedIn: true, subscriptionType: max (or pro)
-```
-
-## Quick Start
-
-```bash
-# 1. Clone
-git clone https://github.com/zacdcook/openclaw-billing-proxy
+git clone https://github.com/kongkong7777/openclaw-billing-proxy.git
 cd openclaw-billing-proxy
+```
 
-# 2. Run setup (auto-detects your config)
+### Step 2: 配置
+
+运行自动配置：
+
+```bash
 node setup.js
-
-# 3. Start the proxy
-node proxy.js
-
-# 4. Update OpenClaw config (see "OpenClaw Configuration" below)
-
-# 5. Restart your OpenClaw gateway
 ```
 
-## OpenClaw Configuration
-
-Add or update the `models.providers.anthropic` section in `~/.openclaw/openclaw.json` to point at the proxy:
+或手动创建 `config.json`：
 
 ```json
 {
-  "models": {
-    "providers": {
-      "anthropic": {
-        "baseUrl": "http://127.0.0.1:18801"
-      }
-    }
-  }
-}
-```
-
-**Important notes:**
-- The `baseUrl` field is the ONLY mechanism that routes OpenClaw traffic through the proxy. Environment variables like `ANTHROPIC_BASE_URL` do NOT control OpenClaw's routing.
-- If you have a direct Anthropic API key in your auth profiles (`~/.openclaw/agents/*/agent/auth-profiles.json`), OpenClaw may prefer that over OAuth and bypass the proxy entirely. Remove or disable the API key auth profile to ensure all traffic goes through the proxy.
-- After updating, restart your OpenClaw gateway for the changes to take effect.
-- Run `node troubleshoot.js` to verify the proxy is working AND that OpenClaw is pointed at it.
-
-### Rollback
-
-To stop using the proxy, change `baseUrl` back to `https://api.anthropic.com` (or remove the `models.providers` section entirely) and restart the gateway.
-
-## Proxy Configuration
-
-The `config.json` file (generated by setup or created manually):
-
-```json
-{
-  "port": 18801,
+  "port": 18804,
   "credentialsPath": "~/.claude/.credentials.json",
-  "replacements": [
-    ["OpenClaw", "OCPlatform"],
-    ["openclaw", "ocplatform"],
-    ["sessions_spawn", "create_task"],
-    ["sessions_list", "list_tasks"],
-    ["sessions_history", "get_history"],
-    ["sessions_send", "send_to_task"],
-    ["sessions_yield", "yield_task"],
-    ["running inside", "running on"]
-  ],
-  "reverseMap": [
-    ["OCPlatform", "OpenClaw"],
-    ["ocplatform", "openclaw"],
-    ["create_task", "sessions_spawn"],
-    ["list_tasks", "sessions_list"],
-    ["get_history", "sessions_history"],
-    ["send_to_task", "sessions_send"],
-    ["yield_task", "sessions_yield"]
-  ]
+  "stripToolDescriptions": true,
+  "injectCCStubs": true
 }
 ```
 
-### Replacement Rules
+### Step 3: 启动
 
-**`replacements`** -- Applied to outbound requests. Each `[find, replace]` pair does a raw string replacement on the request body before forwarding to the API.
+```bash
+node proxy.js
+```
 
-**`reverseMap`** -- Applied to inbound responses. Each `[sanitized, original]` pair restores terms back to their original form before returning to OpenClaw. This ensures tool names, file paths, and identifiers work correctly.
+### Step 4: 配置 OpenClaw
 
-**Important:** Use space-free replacements for lowercase `openclaw`. Replacing `.openclaw/` with `.assistant platform/` (with a space) breaks filesystem paths in tool calls. Use `ocplatform` or similar instead.
-
-### Adding New Patterns
-
-If your OpenClaw version has additional `sessions_*` tools (they add new ones across versions), add them to both `replacements` and `reverseMap`:
+在 OpenClaw 的 `openclaw.json` 中，将 `baseUrl` 改为代理地址：
 
 ```json
 {
-  "replacements": [
-    ["sessions_new_tool", "new_task_tool"]
-  ],
-  "reverseMap": [
-    ["new_task_tool", "sessions_new_tool"]
-  ]
+  "baseUrl": "http://127.0.0.1:18804"
 }
 ```
 
-If you have a custom assistant name that Anthropic blocks (test by checking if requests fail with the name present but pass without it), add it the same way.
+重启 OpenClaw Gateway。
 
-## Running as a Service
+---
 
-### Docker
+## Systemd 服务（推荐）
 
-```bash
-# Start the proxy (uses ~/.claude credentials by default)
-docker compose up -d
+创建 `/etc/systemd/system/billing-proxy.service`：
 
-# Verify
-curl http://127.0.0.1:18801/health
-```
-
-**With an OAuth token instead of credential file:**
-```bash
-# Copy and edit the environment file
-cp .env.example .env
-# Set OAUTH_TOKEN in .env
-
-docker compose up -d
-```
-
-**Custom port:**
-```bash
-PROXY_PORT=9000 docker compose up -d
-```
-
-**Custom replacement rules:**
-
-Uncomment the `config.json` volume mount in `docker-compose.yml`, then create a `config.json` (copy from `config.example.json` and edit).
-
-See `.env.example` for all available environment variables.
-
-> **Note:** macOS Keychain credential extraction does not work inside Docker. Use the `~/.claude` volume mount (default) or set `OAUTH_TOKEN` in `.env`.
-
-### Linux (systemd)
-```bash
-sudo tee /etc/systemd/system/openclaw-proxy.service << EOF
+```ini
 [Unit]
 Description=OpenClaw Billing Proxy
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/node /path/to/proxy.js
+Type=simple
+User=your-user
+WorkingDirectory=/path/to/openclaw-billing-proxy
+ExecStart=/usr/bin/node proxy.js
 Restart=always
-User=YOUR_USER
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable openclaw-proxy
-sudo systemctl start openclaw-proxy
 ```
-
-### Windows (startup)
-Add to your `gateway.cmd` before the gateway launch:
-```cmd
-start "Billing Proxy" /min node "C:\path\to\proxy.js"
-timeout /t 2 /nobreak >nul
-```
-
-### PM2
-```bash
-pm2 start proxy.js --name openclaw-proxy
-pm2 save
-```
-
-## Token Refresh
-
-Claude Code's OAuth token expires every ~24 hours. The proxy reads the token fresh from disk on each request. To refresh:
-
-- **Easiest**: Open Claude Code CLI briefly -- it auto-refreshes on startup
-- **Automated**: Set up a cron that runs `claude -p "ping" --max-turns 1 --no-session-persistence` daily (triggers auth refresh)
-
-## Health Check
 
 ```bash
-curl http://127.0.0.1:18801/health
+sudo systemctl daemon-reload
+sudo systemctl enable billing-proxy
+sudo systemctl start billing-proxy
 ```
 
-Returns token status, request count, uptime, subscription type, and pattern counts.
+---
 
-## How Anthropic's Detection Works (Updated April 8, 2026)
+## 配合 CLIProxyAPI 使用
 
-Anthropic uses four layers to detect third-party tools. v1.x only handled layers 1-2. v2.0 handles all four.
+如果你同时使用 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 管理多个 AI 模型，推荐以下架构：
 
-### Layer 1: Billing Header (string match)
-The API checks the system prompt for `x-anthropic-billing-header`. Without it, OAuth requests go to Extra Usage. Simple 84-char string match.
+```
+:443 (Nginx + TLS)
+  ├─ /v1/messages*  → billing-proxy (:18804) → api.anthropic.com
+  │                   （Claude 走套餐）
+  ├─ /management*   → CLIProxyAPI (:18801)
+  │                   （管理面板）
+  └─ /* (其他 API)  → CLIProxyAPI (:18801)
+                      （GPT/Gemini/Codex 等）
+```
 
-### Layer 2: String Triggers (keyword scan)
-The classifier scans the full request body for known phrases: `OpenClaw`, `sessions_spawn/list/history/send/yield/store`, `HEARTBEAT_OK`, `running inside`, `clawhub`, `clawd`, etc. v1.x handled this. v2.0 expands to 30 patterns.
+CLIProxyAPI 改为内部端口（如 18801），关闭 TLS（由 Nginx 处理）：
 
-### Layer 3: Tool Name Fingerprinting (NEW -- April 8, 2026)
-**The API identifies OpenClaw by the combination of tool names in the request.** This was proved definitively:
-- Identical empty schemas (no descriptions, no properties) with **original tool names** = **FAIL** (2.8K body!)
-- Same empty schemas with **PascalCase CC-like names** = **PASS**
+```yaml
+# CLIProxyAPI config.yaml
+port: 18801
+tls:
+  enable: false
+```
 
-The detector has a signature of OpenClaw's tool name set. When enough matching tool names appear together (threshold: ~25 tools), it flags the request. Individual tools pass; the *combination* triggers it.
+---
 
-The fix: rename all tool names to PascalCase Claude Code convention (`exec` -> `Bash`, `message` -> `SendMessage`, `lcm_grep` -> `ContextGrep`, etc.) throughout the entire body -- tools array, messages, and system prompt.
+## 工具名映射表
 
-### Layer 4: System Prompt Template Matching (NEW -- April 8, 2026)
-The structured config sections (`## Tooling`, `## Workspace`, `## Messaging`, `## Reply Tags`, etc.) match a known template fingerprint. The threshold is ~26K characters. String replacements don't defeat this because the **structure** is preserved even when words change.
+| OpenClaw 工具名 | 伪装后（CC 风格） |
+|---|---|
+| exec | Bash |
+| process | BashSession |
+| browser | BrowserControl |
+| canvas | CanvasView |
+| cron | Scheduler |
+| message | SendMessage |
+| tts | Speech |
+| gateway | SystemCtl |
+| agents_list | AgentList |
+| create_task | TaskCreate |
+| list_tasks | TaskList |
+| get_history | TaskHistory |
+| send_to_task | TaskSend |
+| subagents | AgentControl |
+| session_status | StatusCheck |
+| web_search | WebSearch |
+| web_fetch | WebFetch |
+| pdf | PdfParse |
+| memory_search | KnowledgeSearch |
+| memory_get | KnowledgeGet |
+| yield_task | TaskYield |
+| task_store | TaskStore |
+| task_yield_interrupt | TaskYieldInterrupt |
 
-The fix: strip the entire config section (~28K) and replace with a ~0.5K natural prose paraphrase. The model still functions correctly because tool capabilities are conveyed through the tools array, and behavioral rules come from workspace docs (AGENTS.md, SOUL.md, etc.) which are kept intact.
+另外注入 5 个假 Claude Code 工具：`Glob`, `Grep`, `Agent`, `NotebookEdit`, `TodoRead`
 
-### Detection is cumulative
-The classifier scores the **entire request body** (system + tools + messages), not just the system prompt. Each signal source contributes to an overall score. This means all four layers must be addressed simultaneously for large conversation bodies.
+---
 
-## Why Reverse Mapping Matters
+## 关键词替换表
 
-Without reverse mapping, the model sees sanitized paths in its context (e.g., `.ocplatform/workspace/scripts/`) and uses them for tool calls. But the actual filesystem has `.openclaw/`. The reverse mapping translates API responses back to original terms before OpenClaw processes them, ensuring:
+| 原始 | 替换为 |
+|---|---|
+| OpenClaw | OCPlatform |
+| openclaw | ocplatform |
+| sessions_spawn | create_task |
+| sessions_list | list_tasks |
+| sessions_history | get_history |
+| sessions_send | send_to_task |
+| sessions_yield | yield_task |
+| sessions_store | task_store |
+| HEARTBEAT_OK | HB_ACK |
+| running inside | running on |
 
-- Tool names match OpenClaw's tool registry
-- File paths match the actual filesystem
-- Session management commands use correct identifiers
+响应返回时**自动反向还原**，OpenClaw 无感知。
 
-## Troubleshooting
+---
 
-Run the diagnostic script to identify issues:
+## 属性重命名
+
+| 原始属性 | 替换为 |
+|---|---|
+| session_id | thread_id |
+| conversation_id | thread_ref |
+
+---
+
+## Header 伪装
+
+代理注入完整的 Claude Code HTTP Headers：
+
+- `User-Agent: claude-cli/{version} (external, cli)`
+- `anthropic-version: 2023-06-01`
+- `anthropic-beta: claude-code-20250219,oauth-2025-04-20,...`
+- 完整的 Stainless SDK headers（`x-stainless-*`）
+- `x-claude-code-session-id: {uuid}`
+
+---
+
+## OAuth Token 管理
+
+- 从 `~/.claude/.credentials.json` 读取 Claude Code 的 OAuth token
+- 每次请求时刷新读取（支持 token 自动续期）
+- macOS 支持从 Keychain 提取
+
+---
+
+## 故障排查
 
 ```bash
 node troubleshoot.js
 ```
 
-This tests 8 layers independently (credentials, token, API, billing header, trigger detection, proxy health, end-to-end) and tells you exactly what to fix.
+检查：credentials 文件、token 有效性、网络连通性、API 响应。
 
-### Common Issues
+---
 
-**"Could not find credentials file"**
-- Run `claude auth login` to authenticate (opens browser)
-- On Mac, the file may be at `~/.claude/credentials.json` (no dot prefix) -- the proxy checks both
-- If the file exists but is empty (0 bytes), run `claude auth logout && claude auth login`
-- If still empty on Mac, run `claude -p "test" --max-turns 1` to force a credential write to disk
+## 注意事项
 
-**Proxy returns 400 "out of extra usage" (v2)**
-- If you upgraded from v1.x: the old string-only sanitization no longer works. You need v2.0's full 7-layer processing. Make sure you're running the new `proxy.js`.
-- Check `/health` endpoint -- it should show `version: "2.0.0"` and `layers` object.
-- If v2 is running and still failing: your OpenClaw version may have new tools not in the default rename list. Check the proxy console for `DETECTION!` log lines. Add custom tool renames to `config.json`.
-- If it was working and stopped: Anthropic may have added new detection. Check the repo for updates.
+- 这是非官方工具，Anthropic 可能随时更新检测机制
+- 建议配合 `claude setup-token`（1 年有效期）使用，避免频繁 token 过期
+- 如果出现 "extra usage" 错误，运行 `node troubleshoot.js` 排查
 
-**"Third-party apps now draw from your extra usage"**
-- Same cause as above
-- Disable Extra Usage in your Claude settings to verify subscription billing
-- With v2, restart the OpenClaw gateway to get a fresh conversation (accumulated history can contribute to detection score)
+---
 
-**429 Rate Limit**
-- Normal if you have active Claude Code sessions sharing the rate bucket
-- Wait a few minutes and try again
-- Not a proxy issue
+## 版本历史
 
-**Token Expired**
-- Open Claude Code CLI briefly -- it auto-refreshes on startup
-- Or run: `claude -p "ping" --max-turns 1 --no-session-persistence`
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v2.0 | 2026-04-08 | 四层检测对抗：工具名指纹绕过、系统模板剥离、描述删除、CC 工具注入 |
+| v1.4 | 2026-04-06 | macOS Keychain 支持 |
+| v1.3 | 2026-04-06 | 发现 HEARTBEAT_OK 触发词 |
+| v1.2 | 2026-04-05 | 双向反向映射 |
+| v1.1 | 2026-04-05 | 精简为 7 个已验证触发词 |
+| v1.0 | 2026-04-05 | 基础凭证替换 + 18 个替换规则 |
 
-**HTTP 500: "Unexpected token" / Invalid JSON in credentials**
-- The credentials file has a UTF-8 BOM (byte order mark) -- an invisible character at the start
-- This happens when PowerShell or other editors rewrite the file, or after token auto-refresh
-- v1.4.1+ handles this automatically by stripping the BOM before parsing
-- Manual fix: `node -e "const fs=require('fs');let c=fs.readFileSync(process.env.HOME+'/.claude/.credentials.json','utf8');if(c.charCodeAt(0)===0xFEFF)fs.writeFileSync(process.env.HOME+'/.claude/.credentials.json',c.slice(1))"`
-- Verify with: `node -e "JSON.parse(require('fs').readFileSync(process.env.HOME+'/.claude/.credentials.json','utf8'));console.log('OK')"`
-
-**Tool execution fails / wrong file paths**
-- If the model references `.ocplatform/` instead of `.openclaw/`, your `reverseMap` is missing entries
-- Ensure every `replacements` entry has a matching `reverseMap` entry
-- Use space-free replacements (e.g., `ocplatform`, NOT `assistant platform`) to avoid breaking filesystem paths
-
-**Empty credentials file on Mac / Keychain credentials**
-- Newer Claude Code versions store tokens in macOS Keychain instead of a file
-- The proxy checks these Keychain service names: `Claude Code-credentials`, `claude-code`, `claude`, `com.anthropic.claude-code`
-- Check manually: `security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null`
-- Run `node setup.js` to auto-extract the Keychain token to `~/.claude/.credentials.json`
-- Run `claude -p "test" --max-turns 1` to force credential write if Keychain is also empty
-
-## Disclaimer
-
-This is an unofficial workaround. Anthropic may change their detection at any time. Use at your own risk. This proxy does not modify OpenClaw or Claude Code -- it's a transparent HTTP middleman.
+---
 
 ## License
 
 MIT
+
+---
+
+## 致谢
+
+基于 [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy) 项目。
