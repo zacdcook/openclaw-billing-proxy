@@ -253,7 +253,8 @@ function loadConfig() {
     propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false
+    injectCCStubs: config.injectCCStubs !== false,
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
 
@@ -396,6 +397,40 @@ function processBody(bodyStr, config) {
       + m.slice(sysEnd);
   } else {
     m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
+  }
+
+  // Layer 8: Strip trailing assistant messages (prefill).
+  // OpenClaw 2026.4.5 sometimes pre-fills the next assistant turn (to resume an
+  // interrupted response). Claude Opus 4.6 disabled assistant prefill on the
+  // Anthropic API and now returns 400 with:
+  //   "This model does not support assistant message prefill.
+  //    The conversation must end with a user message."
+  // The error is permanent for the affected session — every retry includes the
+  // same prefill and fails the same way, so the channel becomes stuck until the
+  // session is reset (which most users don't know how to do).
+  //
+  // Strip ALL trailing assistant messages (can be more than one consecutive)
+  // until the array ends with a user message. The model then produces a fresh
+  // response from the last user turn instead of trying to continue from the
+  // pre-filled partial.
+  if (config.stripTrailingAssistantPrefill !== false) {
+    try {
+      const parsed = JSON.parse(m);
+      if (Array.isArray(parsed.messages) && parsed.messages.length > 0) {
+        let popped = 0;
+        while (parsed.messages.length > 0 &&
+               parsed.messages[parsed.messages.length - 1].role === 'assistant') {
+          parsed.messages.pop();
+          popped++;
+        }
+        if (popped > 0) {
+          m = JSON.stringify(parsed);
+          console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s) (${parsed.messages.length} remain)`);
+        }
+      }
+    } catch (e) {
+      console.error(`[STRIP-PREFILL] JSON parse failed: ${e.message}`);
+    }
   }
 
   return m;
