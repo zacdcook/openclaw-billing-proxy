@@ -515,9 +515,29 @@ function startServer(config) {
           return;
         }
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
+          // Tail-buffer reverseMap to avoid pattern split across chunk boundaries.
+          // Without this, a pattern like "ocplatform" can split as "ocp"+"latform"
+          // between TCP chunks; reverseMap on each chunk individually never sees
+          // the full token, so the sanitized name leaks back to the client.
+          // K must be >= the longest pattern in reverseMap. Longest current
+          // pattern is "sessions_yield_interrupt" (24 chars); 64 leaves headroom.
           res.writeHead(status, upRes.headers);
-          upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
-          upRes.on('end', () => res.end());
+          const TAIL_SIZE = 64;
+          let pending = '';
+          upRes.on('data', (chunk) => {
+            pending += chunk.toString();
+            if (pending.length > TAIL_SIZE) {
+              const flushable = pending.slice(0, pending.length - TAIL_SIZE);
+              pending = pending.slice(pending.length - TAIL_SIZE);
+              res.write(reverseMap(flushable, config));
+            }
+          });
+          upRes.on('end', () => {
+            if (pending.length > 0) {
+              res.write(reverseMap(pending, config));
+            }
+            res.end();
+          });
         } else {
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));
