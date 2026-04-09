@@ -8,6 +8,14 @@ After Anthropic revoked subscription billing for third-party tools (April 4, 202
 
 **Zero cost increase. Full OpenClaw functionality. No code changes to OpenClaw.**
 
+Features:
+- 7-layer bidirectional detection bypass (billing header, string sanitization, tool name fingerprinting, system template, tool descriptions, property names, reverse mapping)
+- Prompt caching with 1h TTL (reduced latency and cost)
+- Optional chat log for debugging conversations
+- Detailed per-request token usage logging
+- SSE streaming support with per-chunk reverse mapping
+- Zero dependencies
+
 ## How It Works
 
 The proxy performs 7-layer bidirectional request/response processing to defeat Anthropic's multi-layer detection:
@@ -65,7 +73,10 @@ cd openclaw-billing-proxy
 node setup.js
 
 # 3. Start the proxy
-node proxy.js
+node proxy.js                          # default: cache on, chat log off
+node proxy.js --chatlog                # enable chat log (chat.log)
+node proxy.js --chatlog /tmp/debug.log # chat log to custom file
+node proxy.js --no-cache               # disable prompt caching
 
 # 4. Update OpenClaw config
 # In ~/.openclaw/openclaw.json, change:
@@ -130,6 +141,63 @@ If your OpenClaw version has additional `sessions_*` tools (they add new ones ac
 ```
 
 If you have a custom assistant name that Anthropic blocks (test by checking if requests fail with the name present but pass without it), add it the same way.
+
+## Command Line Options
+
+```
+node proxy.js [--port 18801] [--config config.json]
+              [--chatlog [file]] [--no-cache]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port N` | `18801` | Proxy listen port |
+| `--config file` | `config.json` | Path to config file |
+| `--chatlog [file]` | off | Enable conversation logging (default: `chat.log`) |
+| `--no-cache` | cache enabled | Disable prompt caching (1h TTL) |
+
+## Prompt Caching
+
+The proxy automatically injects `cache_control` with a 1-hour TTL on three breakpoints:
+
+1. **Last system block** -- caches the system prompt
+2. **Last tool** -- caches system + tool definitions
+3. **Last user message** -- caches the entire conversation history
+
+This means repeated requests within 1 hour reuse cached tokens at 1/10th the cost. On a typical conversation with ~30k tokens of context, only the new messages are billed at full price.
+
+Console output shows token breakdown per request:
+```
+[09:34:00] #1 POST /v1/messages (12450b) model=claude-sonnet-4-20250514 msgs=8 stream=true
+[09:34:00] #1 > 200
+[09:34:00] #1   tokens_in=3 cache_read=27000 cache_create=500
+[09:34:02] #1   tokens_out=142 stop=end_turn
+```
+
+- `tokens_in` -- uncacheable tokens (delimiters, overhead)
+- `cache_read` -- tokens read from cache (0.1x cost)
+- `cache_create` -- tokens written to cache for the first time (2x cost, but amortized over subsequent reads)
+- `tokens_out` -- output tokens
+
+Disable with `--no-cache` if you want default 5-minute caching behavior.
+
+## Chat Log
+
+Enable with `--chatlog` to write a readable conversation log for debugging:
+
+```bash
+node proxy.js --chatlog               # writes to chat.log
+node proxy.js --chatlog /tmp/debug.log # custom path
+```
+
+Follow in real-time:
+```bash
+tail -f chat.log
+```
+
+The log captures full system prompts, user/assistant messages, tool calls, thinking blocks, and token usage per request. Useful for debugging sanitization issues or understanding what OpenClaw sends to the API.
+
+Purge anytime with `> chat.log`.
 
 ## Running as a Service
 

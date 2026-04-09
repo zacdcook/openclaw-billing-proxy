@@ -21,6 +21,7 @@
  *
  * Usage:
  *   node proxy.js [--port 18801] [--config config.json]
+ *                  [--chatlog chat.log] [--no-cache]
  */
 
 const http = require('http');
@@ -31,6 +32,7 @@ const os = require('os');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
+const DEFAULT_CHATLOG = 'chat.log';
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.0.0';
 
@@ -186,10 +188,15 @@ function loadConfig() {
   const args = process.argv.slice(2);
   let configPath = null;
   let port = DEFAULT_PORT;
+  let chatlogPath = null;
+  let cacheEnabled = true;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
+    if (args[i] === '--chatlog' && args[i + 1] && !args[i + 1].startsWith('--')) chatlogPath = args[i + 1];
+    else if (args[i] === '--chatlog') chatlogPath = DEFAULT_CHATLOG;
+    if (args[i] === '--no-cache') cacheEnabled = false;
   }
 
   let config = {};
@@ -247,6 +254,8 @@ function loadConfig() {
   return {
     port: config.port || port,
     credsPath,
+    chatlogPath,
+    cacheEnabled,
     replacements: config.replacements || DEFAULT_REPLACEMENTS,
     reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP,
     toolRenames: config.toolRenames || DEFAULT_TOOL_RENAMES,
@@ -398,6 +407,34 @@ function processBody(bodyStr, config) {
     m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
   }
 
+  // Prompt caching: inject cache_control with 1h TTL on system, tools, and last user message
+  if (config.cacheEnabled) {
+    const CACHE_1H = { type: 'ephemeral', ttl: '1h' };
+    try {
+      const parsed = JSON.parse(m);
+      if (Array.isArray(parsed.system) && parsed.system.length > 0) {
+        parsed.system[parsed.system.length - 1].cache_control = CACHE_1H;
+      }
+      if (Array.isArray(parsed.tools) && parsed.tools.length > 0) {
+        parsed.tools[parsed.tools.length - 1].cache_control = CACHE_1H;
+      }
+      if (Array.isArray(parsed.messages)) {
+        for (let i = parsed.messages.length - 1; i >= 0; i--) {
+          if (parsed.messages[i].role === 'user') {
+            const msg = parsed.messages[i];
+            if (Array.isArray(msg.content) && msg.content.length > 0) {
+              msg.content[msg.content.length - 1].cache_control = CACHE_1H;
+            } else if (typeof msg.content === 'string') {
+              msg.content = [{ type: 'text', text: msg.content, cache_control: CACHE_1H }];
+            }
+            break;
+          }
+        }
+      }
+      m = JSON.stringify(parsed);
+    } catch(e) { /* skip caching if JSON parse fails */ }
+  }
+
   return m;
 }
 
@@ -417,6 +454,61 @@ function reverseMap(text, config) {
     r = r.split(sanitized).join(original);
   }
   return r;
+}
+
+// ─── Chat Log ──────────────────────────────────────────────────────────────
+function chatLog(config, text) {
+  if (!config.chatlogPath) return;
+  fs.appendFileSync(config.chatlogPath, text);
+}
+
+function extractMessageText(msg) {
+  if (!msg) return '';
+  if (typeof msg.content === 'string') return msg.content;
+  if (!Array.isArray(msg.content)) return '';
+  const parts = [];
+  for (const block of msg.content) {
+    if (block.type === 'text') parts.push(block.text);
+    else if (block.type === 'tool_use') parts.push(`[tool_use: ${block.name}(${JSON.stringify(block.input)})]`);
+    else if (block.type === 'tool_result') {
+      const content = typeof block.content === 'string' ? block.content
+        : Array.isArray(block.content) ? block.content.map(b => b.text || '').join('') : '';
+      parts.push(`[tool_result: ${content}]`);
+    } else if (block.type === 'thinking') parts.push(`[thinking]\n${block.thinking || ''}`);
+  }
+  return parts.join('\n');
+}
+
+function logRequest(config, reqNum, bodyStr) {
+  if (!config.chatlogPath) return;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    let out = `\n${'═'.repeat(70)}\n#${reqNum} [${ts}] model=${parsed.model || '?'} ${parsed.stream ? 'stream' : 'sync'}\n${'═'.repeat(70)}\n`;
+    if (parsed.system) {
+      const sysTxt = typeof parsed.system === 'string' ? parsed.system
+        : Array.isArray(parsed.system) ? parsed.system.map(b => b.text || '').join('\n') : '';
+      if (sysTxt.length > 0) out += `\n── SYSTEM (${sysTxt.length} chars) ──\n${sysTxt}\n`;
+    }
+    if (Array.isArray(parsed.messages)) {
+      for (const msg of parsed.messages) {
+        out += `\n── ${(msg.role || '?').toUpperCase()} ──\n${extractMessageText(msg)}\n`;
+      }
+    }
+    chatLog(config, out);
+  } catch(e) { /* not JSON */ }
+}
+
+function logResponse(config, reqNum, usage, stopReason, contentText) {
+  if (!config.chatlogPath) return;
+  let out = `\n── ASSISTANT ──\n${contentText}\n`;
+  if (usage) {
+    out += `\n── TOKENS ──\ninput=${usage.input_tokens || 0} output=${usage.output_tokens || 0}`;
+    out += ` cache_read=${usage.cache_read_input_tokens || 0}`;
+    out += ` cache_create=${usage.cache_creation_input_tokens || 0}`;
+    out += ` stop=${stopReason || '?'}\n`;
+  }
+  chatLog(config, out);
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
@@ -490,7 +582,18 @@ function startServer(config) {
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+
+      // Detailed request logging
+      let reqModel = '?', reqMsgCount = 0, reqStream = false;
+      try {
+        const parsed = JSON.parse(bodyStr);
+        reqModel = parsed.model || '?';
+        reqMsgCount = Array.isArray(parsed.messages) ? parsed.messages.length : 0;
+        reqStream = !!parsed.stream;
+      } catch(e) { /* not JSON */ }
+      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b) model=${reqModel} msgs=${reqMsgCount} stream=${reqStream}`);
+
+      logRequest(config, reqNum, bodyStr);
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
@@ -516,13 +619,66 @@ function startServer(config) {
         }
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           res.writeHead(status, upRes.headers);
-          upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
-          upRes.on('end', () => res.end());
+          let sseText = '', sseThinking = '';
+          let sseUsage = null, sseStop = null;
+          let sseToolUses = [];
+
+          upRes.on('data', (chunk) => {
+            const text = chunk.toString();
+            for (const line of text.split('\n')) {
+              if (!line.startsWith('data: ')) continue;
+              try {
+                const evt = JSON.parse(line.slice(6));
+                if (evt.type === 'message_start' && evt.message && evt.message.usage) {
+                  const u = evt.message.usage;
+                  sseUsage = { ...u };
+                  console.log(`[${ts}] #${reqNum}   tokens_in=${u.input_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_create=${u.cache_creation_input_tokens || 0}`);
+                }
+                if (evt.type === 'content_block_start' && evt.content_block && evt.content_block.type === 'tool_use') {
+                  sseToolUses.push({ name: evt.content_block.name, input: '' });
+                }
+                if (evt.type === 'content_block_delta' && evt.delta) {
+                  if (evt.delta.type === 'text_delta') sseText += evt.delta.text || '';
+                  if (evt.delta.type === 'thinking_delta') sseThinking += evt.delta.thinking || '';
+                  if (evt.delta.type === 'input_json_delta' && sseToolUses.length > 0) {
+                    sseToolUses[sseToolUses.length - 1].input += evt.delta.partial_json || '';
+                  }
+                }
+                if (evt.type === 'message_delta') {
+                  const u = evt.usage || {};
+                  if (sseUsage) Object.assign(sseUsage, u);
+                  else sseUsage = { ...u };
+                  sseStop = evt.delta && evt.delta.stop_reason || '?';
+                  console.log(`[${ts}] #${reqNum}   tokens_out=${u.output_tokens || 0} stop=${sseStop}`);
+                }
+              } catch(e) { /* not JSON line */ }
+            }
+            res.write(reverseMap(text, config));
+          });
+          upRes.on('end', () => {
+            let content = '';
+            if (sseThinking) content += `[thinking]\n${sseThinking}\n\n`;
+            content += sseText;
+            for (const tu of sseToolUses) content += `\n[tool_use: ${tu.name}(${tu.input})]`;
+            logResponse(config, reqNum, sseUsage, sseStop, content);
+            res.end();
+          });
         } else {
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));
           upRes.on('end', () => {
             let respBody = Buffer.concat(respChunks).toString();
+            try {
+              const parsed = JSON.parse(respBody);
+              if (parsed.usage) {
+                const u = parsed.usage;
+                console.log(`[${ts}] #${reqNum}   tokens_in=${u.input_tokens || 0} tokens_out=${u.output_tokens || 0} cache_read=${u.cache_read_input_tokens || 0} cache_create=${u.cache_creation_input_tokens || 0} stop=${parsed.stop_reason || '?'}`);
+              }
+              if (parsed.error) console.log(`[${ts}] #${reqNum}   error: ${parsed.error.type}: ${parsed.error.message}`);
+              const contentText = parsed.content ? extractMessageText({ content: parsed.content })
+                : parsed.error ? `[ERROR] ${parsed.error.type}: ${parsed.error.message}` : respBody.slice(0, 500);
+              logResponse(config, reqNum, parsed.usage || null, parsed.stop_reason || null, contentText);
+            } catch(e) { /* not JSON */ }
             respBody = reverseMap(respBody, config);
             const nh = { ...upRes.headers };
             nh['content-length'] = Buffer.byteLength(respBody);
@@ -559,6 +715,8 @@ function startServer(config) {
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
       console.log(`  Credentials:       ${config.credsPath}`);
+      console.log(`  Cache (1h):        ${config.cacheEnabled ? 'enabled' : 'disabled'}`);
+      console.log(`  Chat log:          ${config.chatlogPath || 'disabled'}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
