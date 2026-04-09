@@ -531,6 +531,7 @@ function startServer(config) {
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(errBody);
             res.writeHead(status, nh);
             res.end(errBody);
@@ -538,7 +539,10 @@ function startServer(config) {
           return;
         }
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          res.writeHead(status, upRes.headers);
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];
+          delete sseHeaders['transfer-encoding'];
+          res.writeHead(status, sseHeaders);
           upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
           upRes.on('end', () => res.end());
         } else {
@@ -548,6 +552,7 @@ function startServer(config) {
             let respBody = Buffer.concat(respChunks).toString();
             respBody = reverseMap(respBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(status, nh);
             res.end(respBody);

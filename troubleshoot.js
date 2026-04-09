@@ -282,7 +282,8 @@ async function runTests() {
   if (proxyCheck.status === 200) {
     try {
       const health = JSON.parse(proxyCheck.body);
-      ok('Proxy running', 'Port 18801, ' + health.requestsServed + ' requests served, ' + health.replacementPatterns + ' patterns');
+      const patternCount = health.replacementPatterns || (health.layers && health.layers.stringReplacements) || '?';
+      ok('Proxy running', 'Port 18801, ' + health.requestsServed + ' requests served, ' + patternCount + ' patterns');
       if (health.tokenExpiresInHours && parseFloat(health.tokenExpiresInHours) <= 0) {
         fail('Proxy token expired', 'Run: claude auth login');
       }
@@ -341,7 +342,7 @@ async function runTests() {
           }
         }
       } catch(e) {
-        info('Response: ' + e2e.body.substring(0, 200));
+        info('Response: ' + (e2e.body || e2e.error || 'no response body').substring(0, 200));
       }
     }
   }
