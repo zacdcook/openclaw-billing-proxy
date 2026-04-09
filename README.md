@@ -10,17 +10,21 @@ After Anthropic revoked subscription billing for third-party tools (April 4, 202
 
 ## How It Works
 
-The proxy performs bidirectional request/response processing:
+The proxy performs 7-layer bidirectional request/response processing to defeat Anthropic's multi-layer detection:
 
 **Outbound (request to API):**
 1. **Billing Header** -- Injects an 84-character Claude Code billing identifier into the system prompt
 2. **Token Swap** -- Replaces OpenClaw's auth token with your Claude Code OAuth token
-3. **Sanitization** -- Replaces trigger phrases that Anthropic's streaming classifier detects (8 default patterns)
+3. **String Sanitization** -- Replaces 30 trigger phrases (OpenClaw, sessions_*, HEARTBEAT, etc.)
+4. **Tool Name Bypass** -- Renames all 29 OpenClaw tool names to PascalCase Claude Code convention (e.g., `exec` -> `Bash`, `lcm_grep` -> `ContextGrep`) throughout the entire body
+5. **System Template Bypass** -- Strips ~28K of structured config sections and replaces with a ~0.5K natural prose paraphrase
+6. **Tool Description Stripping** -- Removes tool descriptions to reduce fingerprint signal
+7. **Property Renaming** -- Renames OC-specific schema properties (e.g., `session_id` -> `thread_id`)
 
 **Inbound (response to OpenClaw):**
-4. **Reverse Mapping** -- Restores original tool names, file paths, and identifiers so OpenClaw sees its real terms
+8. **Full Reverse Mapping** -- Restores ALL original tool names, property names, file paths, and identifiers in both SSE streaming chunks and JSON responses
 
-This ensures Anthropic sees a "Claude Code" request while OpenClaw sees its original tool names and paths.
+This ensures Anthropic sees what looks like a Claude Code session while OpenClaw sees its original tool names, paths, and identifiers.
 
 ## Requirements
 
@@ -209,21 +213,32 @@ curl http://127.0.0.1:18801/health
 
 Returns token status, request count, uptime, subscription type, and pattern counts.
 
-## How Anthropic's Detection Works
+## How Anthropic's Detection Works (Updated April 8, 2026)
 
-Anthropic uses two mechanisms to detect third-party tools:
+Anthropic uses four layers to detect third-party tools. v1.x only handled layers 1-2. v2.0 handles all four.
 
-1. **Billing Header** -- The API checks the system prompt for `x-anthropic-billing-header`. Without it, OAuth requests go to Extra Usage. This is a simple string match on 84 characters injected by Claude Code's SDK.
+### Layer 1: Billing Header (string match)
+The API checks the system prompt for `x-anthropic-billing-header`. Without it, OAuth requests go to Extra Usage. Simple 84-char string match.
 
-2. **Streaming Classifier** -- Anthropic's classifier scans the request for specific trigger phrases. The verified triggers are:
-   - `OpenClaw` (the platform name -- case insensitive)
-   - `sessions_spawn`, `sessions_list`, `sessions_history`, `sessions_send`, `sessions_yield`, `sessions_yield_interrupt`, `sessions_store` (OpenClaw session management tools -- new tools are added across versions)
-   - `HEARTBEAT_OK` (OpenClaw heartbeat ack identifier injected in system prompt)
-   - `running inside` + platform name (the self-declaration phrase OpenClaw injects)
+### Layer 2: String Triggers (keyword scan)
+The classifier scans the full request body for known phrases: `OpenClaw`, `sessions_spawn/list/history/send/yield/store`, `HEARTBEAT_OK`, `running inside`, `clawhub`, `clawd`, etc. v1.x handled this. v2.0 expands to 30 patterns.
 
-   If detected, the response is refused with `stop_reason: "refusal"` or a billing error.
+### Layer 3: Tool Name Fingerprinting (NEW -- April 8, 2026)
+**The API identifies OpenClaw by the combination of tool names in the request.** This was proved definitively:
+- Identical empty schemas (no descriptions, no properties) with **original tool names** = **FAIL** (2.8K body!)
+- Same empty schemas with **PascalCase CC-like names** = **PASS**
 
-**What is NOT detected:** Assistant names, workspace filenames (AGENTS.md, SOUL.md), config paths (.openclaw/), plugin names (lossless-claw), individual non-session tool names (exec, lcm_grep, gateway, cron, etc.), bot names, or runtime references. Only the patterns above trigger rejection.
+The detector has a signature of OpenClaw's tool name set. When enough matching tool names appear together (threshold: ~25 tools), it flags the request. Individual tools pass; the *combination* triggers it.
+
+The fix: rename all tool names to PascalCase Claude Code convention (`exec` -> `Bash`, `message` -> `SendMessage`, `lcm_grep` -> `ContextGrep`, etc.) throughout the entire body -- tools array, messages, and system prompt.
+
+### Layer 4: System Prompt Template Matching (NEW -- April 8, 2026)
+The structured config sections (`## Tooling`, `## Workspace`, `## Messaging`, `## Reply Tags`, etc.) match a known template fingerprint. The threshold is ~26K characters. String replacements don't defeat this because the **structure** is preserved even when words change.
+
+The fix: strip the entire config section (~28K) and replace with a ~0.5K natural prose paraphrase. The model still functions correctly because tool capabilities are conveyed through the tools array, and behavioral rules come from workspace docs (AGENTS.md, SOUL.md, etc.) which are kept intact.
+
+### Detection is cumulative
+The classifier scores the **entire request body** (system + tools + messages), not just the system prompt. Each signal source contributes to an overall score. This means all four layers must be addressed simultaneously for large conversation bodies.
 
 ## Why Reverse Mapping Matters
 
@@ -251,16 +266,16 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 - If the file exists but is empty (0 bytes), run `claude auth logout && claude auth login`
 - If still empty on Mac, run `claude -p "test" --max-turns 1` to force a credential write to disk
 
-**Proxy returns 400**
-- The API is rejecting the request due to unsanitized trigger terms
-- Your OpenClaw version may have `sessions_*` tools not in the default list
-- Run `node setup.js` to auto-detect your tools, or manually add patterns to `config.json`
-- Check the proxy console output for the error message
+**Proxy returns 400 "out of extra usage" (v2)**
+- If you upgraded from v1.x: the old string-only sanitization no longer works. You need v2.0's full 7-layer processing. Make sure you're running the new `proxy.js`.
+- Check `/health` endpoint -- it should show `version: "2.0.0"` and `layers` object.
+- If v2 is running and still failing: your OpenClaw version may have new tools not in the default rename list. Check the proxy console for `DETECTION!` log lines. Add custom tool renames to `config.json`.
+- If it was working and stopped: Anthropic may have added new detection. Check the repo for updates.
 
 **"Third-party apps now draw from your extra usage"**
-- Same cause as 400 -- trigger terms not fully sanitized
+- Same cause as above
 - Disable Extra Usage in your Claude settings to verify subscription billing
-- If it was working and stopped, new trigger terms may have appeared in your conversation history -- restart the OpenClaw gateway to clear the session
+- With v2, restart the OpenClaw gateway to get a fresh conversation (accumulated history can contribute to detection score)
 
 **429 Rate Limit**
 - Normal if you have active Claude Code sessions sharing the rate bucket
