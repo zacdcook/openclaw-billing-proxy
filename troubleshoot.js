@@ -380,12 +380,14 @@ async function runTests() {
             info('');
             info('Note: ANTHROPIC_BASE_URL env var does NOT control OpenClaw routing.');
             info('You must set baseUrl in openclaw.json under models.providers.anthropic.');
+            info('If you intentionally use a separate provider for the proxy, this FAIL can be ignored.');
           }
         } else {
           fail('No baseUrl found in OpenClaw config', 'OpenClaw is using the default Anthropic API directly');
           info('Add this to ' + ocPath + ':');
           info('  "models": { "providers": { "anthropic": { "baseUrl": "http://127.0.0.1:18801" } } }');
           info('Then restart the OpenClaw gateway.');
+          info('If you intentionally use a separate provider for the proxy, this FAIL can be ignored.');
         }
       } catch(e) {
         info('Found ' + ocPath + ' but failed to parse: ' + e.message);
