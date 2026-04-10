@@ -36,12 +36,21 @@ const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.2.3';
 
+// macOS Keychain service names to check for Claude Code OAuth credentials
+const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
 
 // Billing fingerprint constants (matches real CC utils/fingerprint.ts)
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
+
+// Token refresh defaults (overridable via config.refreshThresholdMinutes / refreshRetrySeconds)
+const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
+const DEFAULT_REFRESH_RETRY_SECONDS = 15;
+const CLAUDE_CLI_REFRESH_TIMEOUT_MS = 30000;
+const SK_ANT_SYNTHETIC_EXPIRY_MS = 86400000;
 
 // Persistent per-instance identifiers (generated once at startup)
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
@@ -339,13 +348,13 @@ function loadConfig() {
   // macOS Keychain fallback
   if (!credsPath && process.platform === 'darwin') {
     const { execSync } = require('child_process');
-    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
+    for (const svc of KEYCHAIN_SERVICES) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
         if (token) {
           let creds;
           try { creds = JSON.parse(token); } catch(e) {
-            if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+            if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + SK_ANT_SYNTHETIC_EXPIRY_MS, subscriptionType: 'unknown' } };
           }
           if (creds && creds.claudeAiOauth) {
             credsPath = path.join(homeDir, '.claude', '.credentials.json');
@@ -363,7 +372,7 @@ function loadConfig() {
     console.error('[ERROR] Claude Code credentials not found.');
     console.error('Run "claude auth login" first to authenticate.');
     console.error('Searched:', credsPaths.join(', '));
-    if (process.platform === 'darwin') console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code).');
+    if (process.platform === 'darwin') console.error('Also checked macOS Keychain (' + KEYCHAIN_SERVICES.join(', ') + ').');
     console.error('For Docker: set OAUTH_TOKEN in .env or mount ~/.claude as a volume.');
     process.exit(1);
   }
@@ -413,8 +422,83 @@ function loadConfig() {
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
+    refreshRetryMs: (config.refreshRetrySeconds || DEFAULT_REFRESH_RETRY_SECONDS) * 1000,
+    refreshEnabled: config.refreshEnabled !== false
   };
+}
+
+// ─── Credential Refresh ─────────────────────────────────────────────────────
+// Periodically checks token expiry and refreshes via Claude CLI + Keychain.
+// Claude CLI refreshes the Keychain entry (on macOS) or the credentials file
+// (on Linux), so after triggering it we re-extract from Keychain into the
+// snapshot file the proxy reads from.
+function refreshCredentials(credsPath) {
+  if (credsPath === 'env') return false;
+  const { execSync } = require('child_process');
+
+  // Step 1: Trigger Claude CLI to refresh the underlying credential store
+  try {
+    execSync('claude -p "ping" --max-turns 1 --no-session-persistence', {
+      timeout: CLAUDE_CLI_REFRESH_TIMEOUT_MS,
+      stdio: 'pipe'
+    });
+  } catch(e) {
+    console.error('[PROXY] claude CLI refresh failed: ' + (e.message || 'unknown'));
+    // Continue anyway -- Keychain may still have a fresh token from elsewhere
+  }
+
+  // Step 2: On macOS, re-extract from Keychain into the snapshot file
+  if (process.platform === 'darwin') {
+    for (const svc of KEYCHAIN_SERVICES) {
+      try {
+        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+        if (!token) continue;
+        let creds;
+        try { creds = JSON.parse(token); } catch(e) {
+          if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + SK_ANT_SYNTHETIC_EXPIRY_MS, subscriptionType: 'unknown' } };
+        }
+        if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
+          fs.mkdirSync(path.dirname(credsPath), { recursive: true });
+          fs.writeFileSync(credsPath, JSON.stringify(creds));
+          return true;
+        }
+      } catch(e) {}
+    }
+  }
+
+  // Step 3: Verify file is readable and fresh
+  try { getToken(credsPath); return true; } catch(e) { return false; }
+}
+
+// Returns 'retry' if the caller should re-check quickly (e.g. refresh was a
+// no-op because the Claude CLI declined to rotate), 'ok' otherwise.
+function maybeRefreshCredentials(config) {
+  if (!config.refreshEnabled || config.credsPath === 'env') return 'ok';
+  try {
+    const oauth = getToken(config.credsPath);
+    const remainingMs = oauth.expiresAt - Date.now();
+    if (remainingMs > config.refreshThresholdMs) return 'ok';
+    const remainingMin = (remainingMs / 60000).toFixed(1);
+    console.log('[PROXY] Token expires in ' + remainingMin + 'm, refreshing...');
+    if (!refreshCredentials(config.credsPath)) {
+      console.error('[PROXY] Token refresh failed -- run `claude auth login` manually');
+      return 'retry';
+    }
+    const newOauth = getToken(config.credsPath);
+    if (newOauth.expiresAt <= oauth.expiresAt) {
+      const newMin = ((newOauth.expiresAt - Date.now()) / 60000).toFixed(1);
+      console.log('[PROXY] Token refresh was a no-op (still ' + newMin + 'm), retrying shortly');
+      return 'retry';
+    }
+    const newHours = ((newOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+    console.log('[PROXY] Token refreshed, now expires in ' + newHours + 'h');
+    return 'ok';
+  } catch(e) {
+    console.error('[PROXY] Refresh check error: ' + e.message);
+    return 'ok';
+  }
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
@@ -862,6 +946,31 @@ function startServer(config) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
   });
+
+  // Credential refresh (only if file-backed, not env-var mode).
+  // We don't poll on a fixed cadence -- we read the current expiry and
+  // schedule the next check to fire exactly when the token drops below
+  // the threshold. If that refresh is a no-op (Claude CLI declined to
+  // rotate) we retry quickly until it takes.
+  if (config.refreshEnabled && config.credsPath !== 'env') {
+    const thresholdMin = (config.refreshThresholdMs / 60000).toFixed(0);
+    const retrySec = (config.refreshRetryMs / 1000).toFixed(0);
+    console.log(`  Token refresh:     when <${thresholdMin}m remaining (retry ${retrySec}s on no-op)`);
+    const computeNextDelay = () => {
+      try {
+        const oauth = getToken(config.credsPath);
+        const untilCheck = oauth.expiresAt - Date.now() - config.refreshThresholdMs;
+        return Math.max(untilCheck, 0);
+      } catch(e) {
+        return config.refreshRetryMs;
+      }
+    };
+    const scheduleNext = (delay) => setTimeout(() => {
+      const result = maybeRefreshCredentials(config);
+      scheduleNext(result === 'retry' ? config.refreshRetryMs : computeNextDelay());
+    }, delay).unref();
+    scheduleNext(computeNextDelay());
+  }
 
   process.on('SIGINT', () => process.exit(0));
   process.on('SIGTERM', () => process.exit(0));
