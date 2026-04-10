@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.2.5 -- 2026-04-10
+
+### Protect filesystem paths from Layer 2 global string replacement
+
+**Changes:**
+- Layer 2 `split/join` replacements now extract filesystem paths into NUL-delimited
+  placeholders before applying replacements, then restore them after. Paths with 2+
+  segments (e.g. `/home/user/.openclaw/media/...`, `./src/openclaw/mod.js`) are
+  detected by a regex with a negative lookbehind `(?<![\/:])` to skip URL schemes.
+
+**Why:**
+Layer 2 blindly replaced every occurrence of trigger strings (e.g. `openclaw` →
+`tataclaw`) across the entire request body, including inside filesystem paths in
+tool call arguments. This turned `/home/tata/.openclaw/media/...` into
+`/home/tata/.tataclaw/media/...`. OpenClaw's `assertLocalMediaAllowed()` security
+check then rejected the path because it was no longer under an allowed directory
+root.
+
+The response-side `reverseMap()` is left unchanged — its replacements are corrective
+(restoring replaced strings back to originals), so path protection is not needed there.
+
+---
+
 ## v2.2.4 -- 2026-04-09
 
 ### Fix config strip boundary using filesystem paths instead of AGENTS.md (closes #26)

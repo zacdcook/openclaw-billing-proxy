@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.3';
+const VERSION = '2.2.5';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -452,14 +452,46 @@ function findMatchingBracket(str, start) {
   return -1;
 }
 
+// ─── Filesystem Path Protection ─────────────────────────────────────────────
+// Matches absolute paths with 2+ segments (e.g. /home/user/.openclaw/file.png)
+// and relative paths starting with ./ or ../ (e.g. ./src/openclaw/mod.js).
+// Uses NUL byte delimiters as placeholders — safe since NUL never appears in JSON.
+const _FS_PATH_RE = /(?:\.\.?)?(?<![\/:])\/(?:[\w.~@+-]+\/)+[\w.~@+-]*/g;
+
+function protectPaths(str) {
+  const saved = [];
+  const result = str.replace(_FS_PATH_RE, (match) => {
+    saved.push(match);
+    return `\x00P${saved.length - 1}\x00`;
+  });
+  return { result, saved };
+}
+
+function restorePaths(str, saved) {
+  for (let i = 0; i < saved.length; i++) {
+    str = str.split(`\x00P${i}\x00`).join(saved[i]);
+  }
+  return str;
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config) {
   let m = bodyStr;
+
+  // Protect filesystem paths from Layer 2 blind string replacement.
+  // Without this, paths like /home/user/.openclaw/media/... get corrupted
+  // (e.g. .openclaw -> .tataclaw), breaking OpenClaw's assertLocalMediaAllowed()
+  // security check which validates against allowed directory roots.
+  const { result: pathProtected, saved: savedPaths } = protectPaths(m);
+  m = pathProtected;
 
   // Layer 2: String trigger sanitization (global split/join)
   for (const [find, replace] of config.replacements) {
     m = m.split(find).join(replace);
   }
+
+  // Restore protected filesystem paths
+  m = restorePaths(m, savedPaths);
 
   // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
   for (const [orig, cc] of config.toolRenames) {
