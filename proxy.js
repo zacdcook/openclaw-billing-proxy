@@ -47,8 +47,9 @@ const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 
 // Token refresh defaults (overridable via config.refreshCheckMinutes / refreshThresholdMinutes)
-const DEFAULT_REFRESH_CHECK_MINUTES = 0.25;
+const DEFAULT_REFRESH_CHECK_MINUTES = 5;
 const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
+const DEFAULT_REFRESH_RETRY_SECONDS = 15;
 const CLAUDE_CLI_REFRESH_TIMEOUT_MS = 30000;
 const SK_ANT_SYNTHETIC_EXPIRY_MS = 86400000;
 
@@ -425,6 +426,7 @@ function loadConfig() {
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
     refreshIntervalMs: (config.refreshCheckMinutes || DEFAULT_REFRESH_CHECK_MINUTES) * 60 * 1000,
     refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
+    refreshRetryMs: (config.refreshRetrySeconds || DEFAULT_REFRESH_RETRY_SECONDS) * 1000,
     refreshEnabled: config.refreshEnabled !== false
   };
 }
@@ -472,23 +474,32 @@ function refreshCredentials(credsPath) {
   try { getToken(credsPath); return true; } catch(e) { return false; }
 }
 
+// Returns 'retry' if the caller should re-check quickly (e.g. refresh was a
+// no-op because the Claude CLI declined to rotate), 'ok' otherwise.
 function maybeRefreshCredentials(config) {
-  if (!config.refreshEnabled || config.credsPath === 'env') return;
+  if (!config.refreshEnabled || config.credsPath === 'env') return 'ok';
   try {
     const oauth = getToken(config.credsPath);
     const remainingMs = oauth.expiresAt - Date.now();
-    if (remainingMs > config.refreshThresholdMs) return;
+    if (remainingMs > config.refreshThresholdMs) return 'ok';
     const remainingMin = (remainingMs / 60000).toFixed(1);
     console.log('[PROXY] Token expires in ' + remainingMin + 'm, refreshing...');
-    if (refreshCredentials(config.credsPath)) {
-      const newOauth = getToken(config.credsPath);
-      const newHours = ((newOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
-      console.log('[PROXY] Token refreshed, now expires in ' + newHours + 'h');
-    } else {
+    if (!refreshCredentials(config.credsPath)) {
       console.error('[PROXY] Token refresh failed -- run `claude auth login` manually');
+      return 'retry';
     }
+    const newOauth = getToken(config.credsPath);
+    if (newOauth.expiresAt <= oauth.expiresAt) {
+      const newMin = ((newOauth.expiresAt - Date.now()) / 60000).toFixed(1);
+      console.log('[PROXY] Token refresh was a no-op (still ' + newMin + 'm), retrying shortly');
+      return 'retry';
+    }
+    const newHours = ((newOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+    console.log('[PROXY] Token refreshed, now expires in ' + newHours + 'h');
+    return 'ok';
   } catch(e) {
     console.error('[PROXY] Refresh check error: ' + e.message);
+    return 'ok';
   }
 }
 
@@ -938,12 +949,20 @@ function startServer(config) {
     }
   });
 
-  // Periodic credential refresh (only if file-backed, not env-var mode)
+  // Periodic credential refresh (only if file-backed, not env-var mode).
+  // After a successful check the next run is scheduled at the normal interval;
+  // after a no-op/failed refresh we retry quickly so we don't miss the window
+  // where Claude CLI will actually rotate the token.
   if (config.refreshEnabled && config.credsPath !== 'env') {
-    const intervalSec = (config.refreshIntervalMs / 1000).toFixed(0);
+    const intervalMin = (config.refreshIntervalMs / 60000).toFixed(0);
     const thresholdMin = (config.refreshThresholdMs / 60000).toFixed(0);
-    console.log(`  Token refresh:     every ${intervalSec}s, when <${thresholdMin}m remaining`);
-    setInterval(() => maybeRefreshCredentials(config), config.refreshIntervalMs);
+    const retrySec = (config.refreshRetryMs / 1000).toFixed(0);
+    console.log(`  Token refresh:     every ${intervalMin}m, when <${thresholdMin}m remaining (retry ${retrySec}s on no-op)`);
+    const scheduleNext = (delay) => setTimeout(() => {
+      const result = maybeRefreshCredentials(config);
+      scheduleNext(result === 'retry' ? config.refreshRetryMs : config.refreshIntervalMs);
+    }, delay).unref();
+    scheduleNext(config.refreshIntervalMs);
   }
 
   process.on('SIGINT', () => process.exit(0));
