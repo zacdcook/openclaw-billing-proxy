@@ -15,6 +15,9 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 
+// macOS Keychain service names to check for Claude Code OAuth credentials
+const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+
 const homeDir = os.homedir();
 let passed = 0;
 let failed = 0;
@@ -75,8 +78,7 @@ for (const p of credsPaths) {
 if (!credsPath && process.platform === 'darwin') {
   info('No credential files found. Checking macOS Keychain...');
   const { execSync } = require('child_process');
-  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
-  for (const svc of keychainNames) {
+  for (const svc of KEYCHAIN_SERVICES) {
     try {
       const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
       if (token) {
@@ -108,7 +110,7 @@ if (!credsPath || !creds) {
   info('');
   info('Searched files: ' + credsPaths.join(', '));
   if (process.platform === 'darwin') {
-    info('Searched Keychain: Claude Code-credentials, claude-code, claude, com.anthropic.claude-code');
+    info('Searched Keychain: ' + KEYCHAIN_SERVICES.join(', '));
   }
   info('');
   info('To fix:');

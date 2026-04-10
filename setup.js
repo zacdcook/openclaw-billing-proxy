@@ -16,6 +16,9 @@ const os = require('os');
 const DEFAULT_REPLACEMENTS_COUNT = 30;
 const DEFAULT_TOOL_RENAMES_COUNT = 28;
 
+// macOS Keychain service names to check for Claude Code OAuth credentials
+const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+
 const homeDir = os.homedir();
 
 console.log('\n  OpenClaw Billing Proxy Setup');
@@ -54,10 +57,9 @@ if (!creds && process.platform === 'darwin') {
   const { execSync } = require('child_process');
 
   // Try common Keychain service names
-  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
   let keychainToken = null;
 
-  for (const svc of keychainNames) {
+  for (const svc of KEYCHAIN_SERVICES) {
     try {
       keychainToken = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
       if (keychainToken) {
@@ -142,7 +144,7 @@ if (!creds) {
   console.error('   Searched for credentials at:');
   for (const p of credsPaths) { console.error('     ' + p); }
   if (process.platform === 'darwin') {
-    console.error('     macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code)');
+    console.error('     macOS Keychain (' + KEYCHAIN_SERVICES.join(', ') + ')');
   }
   console.error('');
   console.error('   If claude auth status shows you are logged in but no file exists,');

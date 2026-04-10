@@ -36,6 +36,9 @@ const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.2.3';
 
+// macOS Keychain service names to check for Claude Code OAuth credentials
+const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
 
@@ -339,7 +342,7 @@ function loadConfig() {
   // macOS Keychain fallback
   if (!credsPath && process.platform === 'darwin') {
     const { execSync } = require('child_process');
-    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
+    for (const svc of KEYCHAIN_SERVICES) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
         if (token) {
@@ -363,7 +366,7 @@ function loadConfig() {
     console.error('[ERROR] Claude Code credentials not found.');
     console.error('Run "claude auth login" first to authenticate.');
     console.error('Searched:', credsPaths.join(', '));
-    if (process.platform === 'darwin') console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code).');
+    if (process.platform === 'darwin') console.error('Also checked macOS Keychain (' + KEYCHAIN_SERVICES.join(', ') + ').');
     console.error('For Docker: set OAUTH_TOKEN in .env or mount ~/.claude as a volume.');
     process.exit(1);
   }
@@ -442,7 +445,7 @@ function refreshCredentials(credsPath) {
 
   // Step 2: On macOS, re-extract from Keychain into the snapshot file
   if (process.platform === 'darwin') {
-    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
+    for (const svc of KEYCHAIN_SERVICES) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
         if (!token) continue;
