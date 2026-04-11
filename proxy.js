@@ -452,9 +452,77 @@ function findMatchingBracket(str, start) {
   return -1;
 }
 
+// ─── Thinking Block Protection ──────────────────────────────────────────────
+// Anthropic requires thinking/redacted_thinking content blocks to be echoed
+// back byte-identical to what the model originally produced; any mutation
+// triggers:
+//   "thinking or redacted_thinking blocks in the latest assistant message
+//    cannot be modified. These blocks must remain as they were in the
+//    original response."
+// Both the forward pass (Layer 2/3/6 running against assistant message
+// history) and the reverse pass (reverseMap running against responses the
+// client stores and echoes on subsequent turns) mutate these blocks via plain
+// split/join. Mask each content block with a unique placeholder before
+// transforms run, restore after. The placeholder is chosen so no replacement
+// or rename pattern can match it.
+const THINK_MASK_PREFIX = '__OBP_THINK_MASK_';
+const THINK_MASK_SUFFIX = '__';
+const THINK_BLOCK_PATTERNS = ['{"type":"thinking"', '{"type":"redacted_thinking"'];
+
+function maskThinkingBlocks(m) {
+  const masks = [];
+  let out = '';
+  let i = 0;
+  while (i < m.length) {
+    let nextIdx = -1;
+    for (const p of THINK_BLOCK_PATTERNS) {
+      const idx = m.indexOf(p, i);
+      if (idx !== -1 && (nextIdx === -1 || idx < nextIdx)) nextIdx = idx;
+    }
+    if (nextIdx === -1) { out += m.slice(i); break; }
+    out += m.slice(i, nextIdx);
+    // String-aware bracket scan so braces inside the thinking text value
+    // don't corrupt the depth count.
+    let depth = 0, inStr = false, j = nextIdx;
+    while (j < m.length) {
+      const c = m[j];
+      if (inStr) {
+        if (c === '\\') { j += 2; continue; }
+        if (c === '"') inStr = false;
+        j++;
+        continue;
+      }
+      if (c === '"') { inStr = true; j++; continue; }
+      if (c === '{') { depth++; j++; continue; }
+      if (c === '}') { depth--; j++; if (depth === 0) break; continue; }
+      j++;
+    }
+    if (depth !== 0) {
+      // Malformed / truncated — bail without masking the rest
+      out += m.slice(nextIdx);
+      return { masked: out, masks };
+    }
+    masks.push(m.slice(nextIdx, j));
+    out += THINK_MASK_PREFIX + (masks.length - 1) + THINK_MASK_SUFFIX;
+    i = j;
+  }
+  return { masked: out, masks };
+}
+
+function unmaskThinkingBlocks(m, masks) {
+  for (let i = 0; i < masks.length; i++) {
+    m = m.split(THINK_MASK_PREFIX + i + THINK_MASK_SUFFIX).join(masks[i]);
+  }
+  return m;
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config) {
-  let m = bodyStr;
+  // Mask thinking/redacted_thinking content blocks from the transform pipeline
+  // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
+  // return. See "Thinking Block Protection" above.
+  const { masked: maskedBody, masks: thinkMasks } = maskThinkingBlocks(bodyStr);
+  let m = maskedBody;
 
   // Layer 2: String trigger sanitization (global split/join)
   for (const [find, replace] of config.replacements) {
@@ -642,7 +710,7 @@ function processBody(bodyStr, config) {
     }
   }
 
-  return m;
+  return unmaskThinkingBlocks(m, thinkMasks);
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
@@ -774,38 +842,73 @@ function startServer(config) {
           });
           return;
         }
-        // SSE streaming — tail-buffer reverseMap to handle patterns split across
-        // TCP chunk boundaries. Without this, "ocplatform" can split as "ocp"+"latform"
-        // and leak through. TAIL_SIZE >= longest reverseMap pattern. (issue #11)
+        // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
+        // event arrives (terminated by \n\n), then transform per event. This
+        // subsumes the older tail-buffer fix for patterns split across TCP
+        // chunks (#11) because SSE events are self-contained, so patterns
+        // can't span event boundaries. It also lets us track the current
+        // content block type across events and pass thinking/redacted_thinking
+        // bytes through unchanged — Anthropic rejects the next turn otherwise
+        // with "thinking blocks in the latest assistant message cannot be
+        // modified."
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
           delete sseHeaders['transfer-encoding'];   // avoid header conflicts
           res.writeHead(status, sseHeaders);
-          const TAIL_SIZE = 64;
-          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks.
-          // chunk.toString() would emit U+FFFD whenever a multi-byte char (中文,
-          // emoji, etc.) lands on a chunk boundary.
+          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
+          // so multi-byte chars (中文, emoji) that land on a chunk boundary
+          // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
+          let currentBlockIsThinking = false;
+
+          const transformEvent = (event) => {
+            // Locate the data: line (always at the start of an SSE line)
+            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+            if (dataIdx === -1) return reverseMap(event, config);
+            if (dataIdx > 0) dataIdx += 1; // skip the leading \n
+            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+            const dataStr = dataLineEnd === -1
+              ? event.slice(dataIdx + 6)
+              : event.slice(dataIdx + 6, dataLineEnd);
+
+            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
+              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
+                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
+                currentBlockIsThinking = true;
+                return event; // pass through unchanged
+              }
+              currentBlockIsThinking = false;
+              return reverseMap(event, config);
+            }
+            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+              const wasThinking = currentBlockIsThinking;
+              currentBlockIsThinking = false;
+              return wasThinking ? event : reverseMap(event, config);
+            }
+            if (currentBlockIsThinking) {
+              // thinking_delta / signature_delta / etc. inside a thinking block
+              return event;
+            }
+            return reverseMap(event, config);
+          };
+
           upRes.on('data', (chunk) => {
             pending += decoder.write(chunk);
-            if (pending.length > TAIL_SIZE) {
-              let sliceIdx = pending.length - TAIL_SIZE;
-              // Don't cut between a UTF-16 surrogate pair (4-byte UTF-8 chars
-              // like emoji), or flushable would end with a lone high surrogate
-              // that the downstream client can't recombine.
-              const prev = pending.charCodeAt(sliceIdx - 1);
-              if (prev >= 0xD800 && prev <= 0xDBFF) sliceIdx -= 1;
-              const flushable = pending.slice(0, sliceIdx);
-              pending = pending.slice(sliceIdx);
-              res.write(reverseMap(flushable, config));
+            let sepIdx;
+            while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+              const event = pending.slice(0, sepIdx + 2);
+              pending = pending.slice(sepIdx + 2);
+              res.write(transformEvent(event));
             }
           });
           upRes.on('end', () => {
             pending += decoder.end();
             if (pending.length > 0) {
-              res.write(reverseMap(pending, config));
+              // Trailing bytes with no terminator — shouldn't happen in
+              // well-formed SSE, but flush to avoid silent drops.
+              res.write(transformEvent(pending));
             }
             res.end();
           });
@@ -814,7 +917,11 @@ function startServer(config) {
           upRes.on('data', c => respChunks.push(c));
           upRes.on('end', () => {
             let respBody = Buffer.concat(respChunks).toString();
-            respBody = reverseMap(respBody, config);
+            // Mask thinking blocks so reverseMap can't mutate them. The client
+            // stores these bytes and echoes them on the next turn; Anthropic
+            // enforces byte-equality on the latest assistant message.
+            const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
+            respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);
