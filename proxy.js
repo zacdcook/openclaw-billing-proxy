@@ -913,20 +913,62 @@ function startServer(config) {
             res.end();
           });
         } else {
+          // Non-SSE (JSON) response. Some upstream proxies (e.g. CLIProxyAPI
+          // with nonstream-keepalive-interval) inject blank-line heartbeat
+          // bytes into the response stream every N seconds during long-running
+          // inference so that clients don't time out their idle/heartbeat
+          // timer. The previous implementation buffered the entire response
+          // and only flushed at upRes.on('end'), silently absorbing those
+          // heartbeat bytes — clients with a < N-second heartbeat timer (e.g.
+          // OpenClaw at 15s) saw no traffic for the full inference duration
+          // and disconnected.
+          //
+          // Fix: forward any leading ASCII whitespace bytes to the client
+          // immediately as they arrive. Once a non-whitespace byte appears,
+          // the actual JSON body has begun, so switch to the buffer-and-
+          // transform path so reverseMap + thinking-block masking can run on
+          // the complete body. Content-Length is removed because the final
+          // size is unknown when headers are written; Node falls back to
+          // Transfer-Encoding: chunked automatically.
+          let seenRealContent = false;
+          let headersWritten = false;
           const respChunks = [];
-          upRes.on('data', c => respChunks.push(c));
+          const ensureHeaders = () => {
+            if (headersWritten) return;
+            const nh = { ...upRes.headers };
+            delete nh['content-length'];
+            delete nh['transfer-encoding'];
+            try { res.writeHead(status, nh); headersWritten = true; } catch (e) {}
+          };
+          upRes.on('data', c => {
+            if (!seenRealContent) {
+              let i = 0;
+              while (i < c.length) {
+                const b = c[i];
+                if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) { i++; }
+                else { break; }
+              }
+              if (i > 0) {
+                ensureHeaders();
+                try { res.write(c.subarray(0, i)); } catch (e) {}
+              }
+              if (i < c.length) {
+                seenRealContent = true;
+                respChunks.push(c.subarray(i));
+              }
+            } else {
+              respChunks.push(c);
+            }
+          });
           upRes.on('end', () => {
+            ensureHeaders();
             let respBody = Buffer.concat(respChunks).toString();
             // Mask thinking blocks so reverseMap can't mutate them. The client
             // stores these bytes and echoes them on the next turn; Anthropic
             // enforces byte-equality on the latest assistant message.
             const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
             respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding']; // avoid conflict with content-length
-            nh['content-length'] = Buffer.byteLength(respBody);
-            res.writeHead(status, nh);
-            res.end(respBody);
+            try { res.write(respBody); res.end(); } catch (e) {}
           });
         }
       });
