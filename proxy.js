@@ -433,6 +433,34 @@ function getToken(credsPath) {
   return oauth;
 }
 
+// ─── Token Refresh ─────────────────────────────────────────────────────────
+// Best-effort auto-refresh: when a request arrives and the token is already
+// expired, invoke the host's Claude CLI to refresh it. Claude CLI internally
+// uses the refresh_token to obtain a new access_token and writes it back to
+// ~/.claude/.credentials.json. The proxy then re-reads the file.
+//
+// This is a convenience helper only — if it fails, the request proceeds with
+// the expired token and the API will return 401, same as without this code.
+//
+// refreshInProgress deduplicates concurrent calls so only one CLI invocation
+// runs at a time; subsequent requests await the same Promise.
+let refreshInProgress = null;
+
+function refreshOAuthToken() {
+  if (refreshInProgress) return refreshInProgress;
+  refreshInProgress = new Promise((resolve, reject) => {
+    const { execFile } = require('child_process');
+    console.log('[token] Token expired, running claude CLI to refresh...');
+    execFile('claude', ['-p', 'ping', '--max-turns', '1', '--no-session-persistence'], { timeout: 30000, env: { ...process.env, PATH: process.env.PATH + ':/home/ubuntu/.local/bin' } }, (err) => {
+      refreshInProgress = null;
+      if (err) { reject(new Error(`claude refresh failed: ${err.message}`)); return; }
+      console.log('[token] CLI refresh done');
+      resolve();
+    });
+  });
+  return refreshInProgress;
+}
+
 // ─── Helper ─────────────────────────────────────────────────────────────────
 // String-aware bracket matching: skips [/] inside JSON string values so that
 // brackets in tool descriptions or text content don't corrupt the depth count.
@@ -778,7 +806,15 @@ function startServer(config) {
     const chunks = [];
 
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
+      // Best-effort token refresh: if expired, try CLI refresh before proceeding.
+      // On failure, fall through — the original getToken() below handles everything.
+      try {
+        const pre = getToken(config.credsPath);
+        if (isFinite(pre.expiresAt) && pre.expiresAt - Date.now() < 0) {
+          await refreshOAuthToken();
+        }
+      } catch (_) {}
       let body = Buffer.concat(chunks);
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
