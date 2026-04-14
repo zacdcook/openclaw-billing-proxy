@@ -811,10 +811,10 @@ function startServer(config) {
       // On failure, fall through — the original getToken() below handles everything.
       try {
         const pre = getToken(config.credsPath);
-        if (isFinite(pre.expiresAt) && pre.expiresAt - Date.now() < 0) {
+        if (isFinite(pre.expiresAt) && pre.expiresAt - Date.now() < 60000) {
           await refreshOAuthToken();
         }
-      } catch (_) {}
+      } catch (e) { console.log('[token] refresh failed:', e.message); }
       let body = Buffer.concat(chunks);
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
