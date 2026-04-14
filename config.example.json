@@ -4,7 +4,7 @@
 
   "stripSystemConfig": true,
   "stripToolDescriptions": true,
-  "injectCCStubs": true,
+  "injectCCStubs": false,
 
   "_comment_layers": "All v2 layers enabled by default. Set to false to disable individual layers.",
   "_comment_config": "The replacements, reverseMap, toolRenames, and propRenames arrays below show the defaults. You only need config.json if you want to customize them.",

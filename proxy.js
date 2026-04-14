@@ -52,21 +52,40 @@ const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
-  'advanced-tool-use-2025-11-20',
-  'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24',
-  'fast-mode-2026-02-01'
+  'context-management-2025-06-27'
 ];
+
+function getModelBetas(modelId) {
+  const m = (modelId || '').toLowerCase();
+  const betas = [...REQUIRED_BETAS];
+  // Haiku cannot handle interleaved-thinking — it 400s
+  if (m.includes('haiku')) {
+    const idx = betas.indexOf('interleaved-thinking-2025-05-14');
+    if (idx !== -1) betas.splice(idx, 1);
+  }
+  // Sonnet 4-6 and Opus 4-6 get the effort beta
+  if (m.includes('4-6') || m.includes('4_6')) {
+    if (!betas.includes('effort-2025-11-24')) betas.push('effort-2025-11-24');
+  }
+  return betas;
+}
+
+// OAuth token cache (for refresh support)
+const OAUTH_TOKEN_URL = 'https://claude.ai/v1/oauth/token';
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+let _cachedToken = null;     // { accessToken, refreshToken, expiresAt, subscriptionType }
+let _credsFilePath = null;   // Set during loadConfig, used for writing back refreshed creds
+let _refreshPromise = null;  // In-flight refresh dedup: prevents concurrent refresh races
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
 const CC_TOOL_STUBS = [
-  '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
-  '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
-  '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
-  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
-  '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
+  '{"name":"mcp_Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
+  '{"name":"mcp_Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
+  '{"name":"mcp_Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
+  '{"name":"mcp_NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
+  '{"name":"mcp_TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
@@ -123,11 +142,16 @@ function extractFirstUserText(bodyStr) {
     .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 }
 
-function buildBillingBlock(bodyStr) {
-  const firstText = extractFirstUserText(bodyStr);
+function computeCch(text) {
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 5);
+}
+
+function buildBillingBlock(bodyStr, preExtractedText) {
+  const firstText = preExtractedText !== undefined ? preExtractedText : extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const ccVersion = `${CC_VERSION}.${fingerprint}`;
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+  const cch = computeCch(firstText);
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=${cch};"}`;
 }
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
@@ -143,7 +167,7 @@ function getStainlessHeaders() {
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.81.0',
+    'x-stainless-package-version': '0.90.0',
     'x-stainless-runtime': 'node',
     'x-stainless-runtime-version': process.version,
     'x-stainless-retry-count': '0',
@@ -181,7 +205,6 @@ const DEFAULT_REPLACEMENTS = [
   ['billing-proxy', 'routing-layer'],
   ['x-anthropic-billing-header', 'x-routing-config'],
   ['x-anthropic-billing', 'x-routing-cfg'],
-  ['cch=00000', 'cfg=00000'],
   ['cc_version', 'rt_version'],
   ['cc_entrypoint', 'rt_entrypoint'],
   ['billing header', 'routing config'],
@@ -200,24 +223,24 @@ const DEFAULT_REPLACEMENTS = [
 //
 // ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
 const DEFAULT_TOOL_RENAMES = [
-  ['exec', 'Bash'],
-  ['process', 'BashSession'],
-  ['browser', 'BrowserControl'],
-  ['canvas', 'CanvasView'],
-  ['nodes', 'DeviceControl'],
-  ['cron', 'Scheduler'],
-  ['message', 'SendMessage'],
-  ['tts', 'Speech'],
-  ['gateway', 'SystemCtl'],
-  ['agents_list', 'AgentList'],
-  ['list_tasks', 'TaskList'],
-  ['get_history', 'TaskHistory'],
-  ['send_to_task', 'TaskSend'],
-  ['create_task', 'TaskCreate'],
-  ['subagents', 'AgentControl'],
-  ['session_status', 'StatusCheck'],
-  ['web_search', 'WebSearch'],
-  ['web_fetch', 'WebFetch'],
+  ['exec', 'mcp_Bash'],
+  ['process', 'mcp_BashSession'],
+  ['browser', 'mcp_BrowserControl'],
+  ['canvas', 'mcp_CanvasView'],
+  ['nodes', 'mcp_DeviceControl'],
+  ['cron', 'mcp_Scheduler'],
+  ['message', 'mcp_SendMessage'],
+  ['tts', 'mcp_Speech'],
+  ['gateway', 'mcp_SystemCtl'],
+  ['agents_list', 'mcp_AgentList'],
+  ['list_tasks', 'mcp_TaskList'],
+  ['get_history', 'mcp_TaskHistory'],
+  ['send_to_task', 'mcp_TaskSend'],
+  ['create_task', 'mcp_TaskCreate'],
+  ['subagents', 'mcp_AgentControl'],
+  ['session_status', 'mcp_StatusCheck'],
+  ['web_search', 'mcp_WebSearch'],
+  ['web_fetch', 'mcp_WebFetch'],
   // NOTE: ['image', 'ImageGen'] removed — collides with Anthropic content block
   // type "image". OpenClaw tool_results carrying image content blocks would have
   // their `"type": "image"` field renamed and Anthropic rejects with:
@@ -225,19 +248,19 @@ const DEFAULT_TOOL_RENAMES = [
   //   using 'type' does not match any of the expected tags
   // The fingerprint signal lost from one tool name is much smaller than the
   // certainty of breaking every conversation that ever touched an image. (issue #14)
-  ['pdf', 'PdfParse'],
-  ['image_generate', 'ImageCreate'],
-  ['music_generate', 'MusicCreate'],
-  ['video_generate', 'VideoCreate'],
-  ['memory_search', 'KnowledgeSearch'],
-  ['memory_get', 'KnowledgeGet'],
-  ['lcm_expand_query', 'ContextQuery'],
-  ['lcm_grep', 'ContextGrep'],
-  ['lcm_describe', 'ContextDescribe'],
-  ['lcm_expand', 'ContextExpand'],
-  ['yield_task', 'TaskYield'],
-  ['task_store', 'TaskStore'],
-  ['task_yield_interrupt', 'TaskYieldInterrupt']
+  ['pdf', 'mcp_PdfParse'],
+  ['image_generate', 'mcp_ImageCreate'],
+  ['music_generate', 'mcp_MusicCreate'],
+  ['video_generate', 'mcp_VideoCreate'],
+  ['memory_search', 'mcp_KnowledgeSearch'],
+  ['memory_get', 'mcp_KnowledgeGet'],
+  ['lcm_expand_query', 'mcp_ContextQuery'],
+  ['lcm_grep', 'mcp_ContextGrep'],
+  ['lcm_describe', 'mcp_ContextDescribe'],
+  ['lcm_expand', 'mcp_ContextExpand'],
+  ['yield_task', 'mcp_TaskYield'],
+  ['task_store', 'mcp_TaskStore'],
+  ['task_yield_interrupt', 'mcp_TaskYieldInterrupt']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -278,7 +301,6 @@ const DEFAULT_REVERSE_MAP = [
   ['routing-layer', 'billing-proxy'],
   ['x-routing-config', 'x-anthropic-billing-header'],
   ['x-routing-cfg', 'x-anthropic-billing'],
-  ['cfg=00000', 'cch=00000'],
   ['rt_version', 'cc_version'],
   ['rt_entrypoint', 'cc_entrypoint'],
   ['routing config', 'billing header'],
@@ -403,6 +425,9 @@ function loadConfig() {
     console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
   }
 
+  // Store the credentials file path for token refresh writes
+  _credsFilePath = credsPath;
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
@@ -412,7 +437,8 @@ function loadConfig() {
     propRenames,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false,
+    // CC tool stubs disabled by default - causes 'tool not found' loops (issue #43). Enable only if needed for detection evasion testing.
+    injectCCStubs: config.injectCCStubs === true,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
@@ -433,6 +459,107 @@ function getToken(credsPath) {
   return oauth;
 }
 
+async function refreshOAuthToken(refreshToken) {
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: OAUTH_CLIENT_ID,
+    refresh_token: refreshToken,
+  }).toString();
+
+  const res = await fetch(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  if (!res.ok) {
+    throw new Error(`Token refresh HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error('Token refresh: no access_token in response');
+  }
+
+  const newToken = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token ?? refreshToken, // rotate if provided
+    expiresAt: Date.now() + (data.expires_in ?? 36000) * 1000,
+    subscriptionType: _cachedToken?.subscriptionType ?? 'unknown',
+  };
+
+  // Update cache
+  _cachedToken = newToken;
+
+  // Write updated token back to credentials file (so next startup uses fresh token)
+  if (_credsFilePath && _credsFilePath !== 'env') {
+    try {
+      let raw = fs.readFileSync(_credsFilePath, 'utf8');
+      if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+      const creds = JSON.parse(raw);
+      creds.claudeAiOauth = {
+        ...creds.claudeAiOauth,
+        accessToken: newToken.accessToken,
+        refreshToken: newToken.refreshToken,
+        expiresAt: newToken.expiresAt,
+      };
+      fs.writeFileSync(_credsFilePath, JSON.stringify(creds, null, 2), 'utf8');
+      console.log('[OAUTH] Refreshed token written back to credentials file.');
+    } catch (writeErr) {
+      console.warn('[OAUTH] Could not write refreshed token to file:', writeErr.message);
+    }
+  }
+
+  console.log(`[OAUTH] Token refreshed. Expires in ${Math.round((data.expires_in ?? 36000) / 3600)}h.`);
+  return newToken;
+}
+
+async function getTokenAsync(credsPath) {
+  // Env var mode: no refresh possible
+  if (credsPath === 'env') {
+    return getToken(credsPath); // falls back to sync version
+  }
+
+  // Return cached token if still fresh (more than 5 minutes remaining)
+  if (_cachedToken && (_cachedToken.expiresAt - Date.now()) > 5 * 60 * 1000) {
+    return _cachedToken;
+  }
+
+  // Load from file (to get refresh_token)
+  let raw = fs.readFileSync(credsPath, 'utf8');
+  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+  const creds = JSON.parse(raw);
+  const oauth = creds.claudeAiOauth;
+  if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
+
+  // Cache what we loaded
+  _cachedToken = {
+    accessToken: oauth.accessToken,
+    refreshToken: oauth.refreshToken,
+    expiresAt: oauth.expiresAt ?? Infinity,
+    subscriptionType: oauth.subscriptionType ?? 'unknown',
+  };
+
+  // Check if token needs refresh (expired or expiring in < 5 minutes)
+  const timeRemaining = (_cachedToken.expiresAt - Date.now());
+  if (timeRemaining < 5 * 60 * 1000 && _cachedToken.refreshToken) {
+    // Dedup concurrent refreshes: if a refresh is already in-flight, await the same promise
+    // rather than launching another one (which would invalidate the in-flight refresh token).
+    if (!_refreshPromise) {
+      console.log('[OAUTH] Token expiring soon, refreshing...');
+      _refreshPromise = refreshOAuthToken(_cachedToken.refreshToken)
+        .finally(() => { _refreshPromise = null; });
+    }
+    try {
+      _cachedToken = await _refreshPromise;
+    } catch (refreshErr) {
+      console.warn('[OAUTH] Refresh failed, using existing token:', refreshErr.message);
+      // Continue with existing token — better than failing outright
+    }
+  }
+
+  return _cachedToken;
+}
+
 // ─── Helper ─────────────────────────────────────────────────────────────────
 // String-aware bracket matching: skips [/] inside JSON string values so that
 // brackets in tool descriptions or text content don't corrupt the depth count.
@@ -450,6 +577,56 @@ function findMatchingBracket(str, start) {
     else if (c === ']') { d--; if (d === 0) return i; }
   }
   return -1;
+}
+
+// String-aware brace matching: skips {/} inside JSON string values.
+// Counterpart to findMatchingBracket which handles [/] only.
+function findMatchingBrace(str, start) {
+  let d = 0, inStr = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') d++;
+    else if (c === '}') { d--; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+// Strips "effort" key-value from an object (by key name) in a raw JSON string.
+// Uses findMatchingBrace to safely handle nested structures.
+function stripEffortFromObject(str, objectKey) {
+  const keyPattern = '"' + objectKey + '"';
+  let pos = str.indexOf(keyPattern);
+  if (pos === -1) return str;
+  // Find the opening { of the value
+  let braceStart = str.indexOf('{', pos + keyPattern.length);
+  if (braceStart === -1) return str;
+  // Find the matching closing } using brace matcher (not bracket matcher)
+  const braceEnd = findMatchingBrace(str, braceStart);
+  if (braceEnd === -1) return str;
+
+  const inner = str.slice(braceStart + 1, braceEnd);
+  // Remove the effort field (handles leading/trailing comma, various value types)
+  let cleaned = inner
+    .replace(/,\s*"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null)/, '')
+    .replace(/"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null),?\s*/, '');
+  cleaned = cleaned.replace(/,\s*$/, '').trim();
+
+  if (cleaned === '') {
+    // Remove the entire key: "output_config":{...} including preceding comma if any
+    const keyStart = str.lastIndexOf(',', pos);
+    if (keyStart !== -1 && str.slice(keyStart, pos).trim() === ',') {
+      return str.slice(0, keyStart) + str.slice(braceEnd + 1);
+    }
+    return str.slice(0, pos) + str.slice(braceEnd + 1);
+  }
+
+  return str.slice(0, braceStart + 1) + cleaned + str.slice(braceEnd);
 }
 
 // ─── Thinking Block Protection ──────────────────────────────────────────────
@@ -516,8 +693,114 @@ function unmaskThinkingBlocks(m, masks) {
   return m;
 }
 
+// ─── Tool Pair Repair ───────────────────────────────────────────────────────
+// Removes orphaned tool_use / tool_result blocks from conversation history.
+// An orphaned tool_use has no matching tool_result; an orphaned tool_result
+// has no matching tool_use. Both cause Anthropic API validation errors.
+// Ported from opencode-claude-auth/src/transforms.ts repairToolPairs().
+function repairToolPairs(bodyStr) {
+  // Find the messages array in the body
+  const msgsStart = bodyStr.indexOf('"messages":[');
+  if (msgsStart === -1) return bodyStr;
+
+  // Find the end of the messages array using bracket matching
+  const arrayOpenIdx = msgsStart + '"messages":'.length;
+  const arrayCloseIdx = findMatchingBracket(bodyStr, arrayOpenIdx);
+  if (arrayCloseIdx === -1) return bodyStr;
+
+  const messagesJson = bodyStr.slice(arrayOpenIdx, arrayCloseIdx + 1);
+  let messages;
+  try {
+    messages = JSON.parse(messagesJson);
+  } catch (e) {
+    console.warn('[REPAIR] Could not parse messages array:', e.message);
+    return bodyStr;
+  }
+
+  if (!Array.isArray(messages)) return bodyStr;
+
+  // Collect all tool_use IDs and tool_result tool_use_ids
+  const toolUseIds = new Set();
+  const toolResultIds = new Set();
+
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string') {
+        toolUseIds.add(block.id);
+      }
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+        toolResultIds.add(block.tool_use_id);
+      }
+    }
+  }
+
+  // Find orphaned IDs
+  const orphanedUses = new Set();
+  for (const id of toolUseIds) {
+    if (!toolResultIds.has(id)) orphanedUses.add(id);
+  }
+  const orphanedResults = new Set();
+  for (const id of toolResultIds) {
+    if (!toolUseIds.has(id)) orphanedResults.add(id);
+  }
+
+  // Early return if nothing to fix
+  if (orphanedUses.size === 0 && orphanedResults.size === 0) return bodyStr;
+
+  console.log(`[REPAIR] Removing ${orphanedUses.size} orphaned tool_use and ${orphanedResults.size} orphaned tool_result blocks`);
+
+  // Remove messages that become empty after filtering.
+  // Guard against creating adjacent same-role turns (violates Anthropic alternating-turn rule).
+  const candidateRepaired = messages
+    .map((message) => {
+      if (!Array.isArray(message.content)) return message;
+      const filtered = message.content.filter((block) => {
+        if (block.type === 'tool_use' && typeof block.id === 'string') {
+          return !orphanedUses.has(block.id);
+        }
+        if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+          return !orphanedResults.has(block.tool_use_id);
+        }
+        return true;
+      });
+      if (filtered.length === 0) return null; // mark for removal
+      return { ...message, content: filtered };
+    });
+
+  // Remove nulls, but check for adjacent same-role violations first.
+  // If removing a null would put two messages of the same role adjacent,
+  // fall back to a minimal placeholder for that message to preserve turn order.
+  const repaired = [];
+  for (let i = 0; i < candidateRepaired.length; i++) {
+    if (candidateRepaired[i] !== null) {
+      repaired.push(candidateRepaired[i]);
+    } else {
+      // Check if dropping this message creates adjacent same-role
+      const prevRole = repaired.length > 0 ? repaired[repaired.length - 1].role : null;
+      const nextMsg = candidateRepaired.slice(i + 1).find(m => m !== null);
+      const nextRole = nextMsg ? nextMsg.role : null;
+      if (prevRole && nextRole && prevRole === nextRole) {
+        // Would create adjacent same-role — keep with minimal placeholder
+        repaired.push({ ...messages[i], content: [{ type: 'text', text: '(removed)' }] });
+      }
+      // else: drop message entirely (no adjacent same-role issue)
+    }
+  }
+
+  const repairedJson = JSON.stringify(repaired);
+  return bodyStr.slice(0, arrayOpenIdx) + repairedJson + bodyStr.slice(arrayCloseIdx + 1);
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config) {
+  // Repair orphaned tool_use/tool_result pairs before any transforms.
+  // Must run on the original body (pre-masking) since masking corrupts JSON.parse.
+  bodyStr = repairToolPairs(bodyStr);
+
+  // Extract original first user text for billing fingerprint BEFORE any transforms
+  const originalFirstUserText = extractFirstUserText(bodyStr);
+
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
   // return. See "Thinking Block Protection" above.
@@ -527,6 +810,16 @@ function processBody(bodyStr, config) {
   // Layer 2: String trigger sanitization (global split/join)
   for (const [find, replace] of config.replacements) {
     m = m.split(find).join(replace);
+  }
+
+  // Layer 2.5: Strip effort param for Haiku models (Haiku rejects effort with 400)
+  {
+    const modelMatch = /"model"\s*:\s*"([^"]+)"/.exec(m);
+    if (modelMatch && modelMatch[1].toLowerCase().includes('haiku')) {
+      m = stripEffortFromObject(m, 'output_config');
+      m = stripEffortFromObject(m, 'thinking');
+      console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
+    }
   }
 
   // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
@@ -542,33 +835,87 @@ function processBody(bodyStr, config) {
   // Layer 4: System prompt template bypass
   // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
   // and replace with a brief paraphrase. The config is between the identity line
-  // ("You are a personal assistant") and the first workspace doc (AGENTS.md header).
+  // and the first workspace doc header (filesystem path).
   // IMPORTANT: Search WITHIN the system array, not from the start of the body.
   // The identity line can appear in conversation history (from prior discussions),
   // and matching there instead of the system prompt causes the strip to fail.
+  //
+  // Multi-marker detection: OpenClaw identity text varies by config. Try all known
+  // variants in order of specificity. The first match wins.
   if (config.stripSystemConfig) {
-    const IDENTITY_MARKER = 'You are a personal assistant';
-    // Anchor search to the system array so we don't match conversation history
+    // Known OpenClaw identity line variants (in priority order).
+    // Add new variants here if detection gaps are observed in the wild.
+    const IDENTITY_MARKERS = [
+      'You are a personal assistant',
+      'You are an AI assistant',
+      'You are a helpful assistant',
+      'You are an intelligent assistant',
+      'You are an AI agent',
+      'You are an agent',
+    ];
+
+    // End-boundary patterns: the config section always ends at the first workspace
+    // doc header, which starts with a filesystem path after the \n## prefix.
+    // Previous approach used 'AGENTS.md' as the landmark, but that string can appear
+    // earlier in skill content or LCM summaries, causing a premature boundary. (issue #26)
+    // Workspace doc headers always start with a filesystem path:
+    //   Linux/macOS: \n## /home/..., \n## /Users/..., or \n## /root/...
+    //   Windows:     \n## C:\\ or \n## D:\\ (any drive letter)
+    //   Network/UNC: \n## //  or \n## \\\\
+    const END_BOUNDARY_PATTERNS = [
+      '\\n## /',          // Linux/macOS absolute paths (/home/, /Users/, /root/, etc.)
+      '\\n## \\\\\\\\',  // UNC paths (\\server\share)
+      '\\n## //',         // Network paths
+    ];
+
+    // Anchor search strictly within the system array to avoid matching conversation history
     const sysArrayStart = m.indexOf('"system":[');
+    let sysArrayEnd = -1;
+    if (sysArrayStart !== -1) {
+      sysArrayEnd = findMatchingBracket(m, sysArrayStart + '"system":'.length);
+    }
     const searchFrom = sysArrayStart !== -1 ? sysArrayStart : 0;
-    const configStart = m.indexOf(IDENTITY_MARKER, searchFrom);
+    const searchTo = sysArrayEnd !== -1 ? sysArrayEnd : m.length;
+
+    // Try each identity marker, take the first match found WITHIN the system array only
+    let configStart = -1;
+    let matchedMarker = '';
+    for (const marker of IDENTITY_MARKERS) {
+      const idx = m.indexOf(marker, searchFrom);
+      if (idx !== -1 && idx < searchTo) {
+        configStart = idx;
+        matchedMarker = marker;
+        break;
+      }
+    }
+
     if (configStart !== -1) {
       let stripFrom = configStart;
       if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      // Find end of config: first workspace doc header (a ## section with a filesystem path).
-      // Previous approach used 'AGENTS.md' as the landmark, but that string can appear
-      // earlier in skill content or LCM summaries, causing a premature boundary. (issue #26)
-      // Workspace doc headers always start with a filesystem path:
-      //   Linux/macOS: \n## /home/... or \n## /Users/...
-      //   Windows:     \n## C:\\...
-      let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
-      if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
-      if (configEnd !== -1) {
-        const boundary = configEnd;
 
-        const strippedLen = boundary - stripFrom;
+      // Try each end-boundary pattern; take the earliest match after configStart
+      let configEnd = -1;
+      const searchAfter = configStart + matchedMarker.length;
+      for (const pat of END_BOUNDARY_PATTERNS) {
+        const idx = m.indexOf(pat, searchAfter);
+        if (idx !== -1 && (configEnd === -1 || idx < configEnd)) {
+          configEnd = idx;
+        }
+      }
+      // Generic Windows drive letter check (any letter A-Z followed by :\)
+      {
+        const winPattern = /\\n## [A-Z]:\\\\/g;
+        winPattern.lastIndex = searchAfter;
+        const wm = winPattern.exec(m);
+        if (wm !== null && (configEnd === -1 || wm.index < configEnd)) {
+          configEnd = wm.index;
+        }
+      }
+
+      if (configEnd !== -1) {
+        const strippedLen = configEnd - stripFrom;
         if (strippedLen > 1000) {
           const PARAPHRASE =
             '\\nYou are an AI operations assistant with access to all tools listed in this request ' +
@@ -579,9 +926,13 @@ function processBody(bodyStr, config) {
             'Skills defined in your workspace should be invoked when they match user requests. ' +
             'Consult your workspace reference files for detailed operational configuration.\\n';
 
-          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
-          console.log(`[STRIP] Removed ${strippedLen} chars of config template`);
+          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(configEnd);
+          console.log(`[STRIP] Removed ${strippedLen} chars of config template (marker: "${matchedMarker}")`);
         }
+      } else {
+        // Safety: all boundary patterns failed — skip stripping to avoid corrupting the body.
+        // This can happen with non-standard workspace layouts. Log and continue without strip.
+        console.warn(`[STRIP] Layer 4: identity marker found ("${matchedMarker}") but no end boundary detected — skipping strip to preserve body integrity`);
       }
     }
   }
@@ -625,7 +976,7 @@ function processBody(bodyStr, config) {
   }
 
   // Layer 1: Billing header injection (dynamic fingerprint per request)
-  const BILLING_BLOCK = buildBillingBlock(m);
+  const BILLING_BLOCK = buildBillingBlock(m, originalFirstUserText);
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
@@ -746,8 +1097,8 @@ function startServer(config) {
   const server = http.createServer((req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
       try {
-        const oauth = getToken(config.credsPath);
-        const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+        const tokenInfo = _cachedToken || getToken(config.credsPath);
+        const expiresIn = (tokenInfo.expiresAt - Date.now()) / 3600000;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
@@ -756,7 +1107,8 @@ function startServer(config) {
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
           tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
-          subscriptionType: oauth.subscriptionType,
+          tokenCached: !!_cachedToken,
+          subscriptionType: tokenInfo.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
             toolNameRenames: config.toolRenames.length,
@@ -778,10 +1130,10 @@ function startServer(config) {
     const chunks = [];
 
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
       let body = Buffer.concat(chunks);
       let oauth;
-      try { oauth = getToken(config.credsPath); } catch (e) {
+      try { oauth = await getTokenAsync(config.credsPath); } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
         return;
@@ -789,6 +1141,9 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
+      // Extract model from original body for beta selection
+      const modelMatch = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+      const requestModel = modelMatch ? modelMatch[1] : '';
       bodyStr = processBody(bodyStr, config);
       body = Buffer.from(bodyStr, 'utf8');
 
@@ -811,9 +1166,10 @@ function startServer(config) {
         headers[k] = v;
       }
 
+      const modelBetas = getModelBetas(requestModel);
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
+      for (const b of modelBetas) { if (!betas.includes(b)) betas.push(b); }
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
@@ -825,6 +1181,11 @@ function startServer(config) {
       }, (upRes) => {
         const status = upRes.statusCode;
         console.log(`[${ts}] #${reqNum} > ${status}`);
+        if (status === 401) {
+          // Token may have expired — force cache invalidation so next request refreshes
+          console.warn(`[${ts}] #${reqNum} Got 401 from Anthropic — forcing token cache invalidation.`);
+          _cachedToken = null;
+        }
         if (status !== 200 && status !== 201) {
           const errChunks = [];
           upRes.on('data', c => errChunks.push(c));
