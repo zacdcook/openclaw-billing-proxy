@@ -446,14 +446,37 @@ function getToken(credsPath) {
 // runs at a time; subsequent requests await the same Promise.
 let refreshInProgress = null;
 
+// Find claude CLI: 1. config.json "claudeBin"  2. PATH  3. ~/.local/bin/claude
+function findClaudeBin() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+    if (cfg.claudeBin && fs.existsSync(cfg.claudeBin)) return cfg.claudeBin;
+  } catch (_) {}
+  try {
+    return require('child_process').execSync('command -v claude 2>/dev/null', { encoding: 'utf8' }).trim();
+  } catch (_) {}
+  const guess = path.join(os.homedir(), '.local', 'bin', 'claude');
+  if (fs.existsSync(guess)) return guess;
+  return null;
+}
+
 function refreshOAuthToken() {
   if (refreshInProgress) return refreshInProgress;
+  const bin = findClaudeBin();
+  if (!bin) {
+    console.log('[token] Token expired but claude CLI not found, skipping refresh (set "claudeBin" in config.json)');
+    return Promise.resolve();
+  }
   refreshInProgress = new Promise((resolve, reject) => {
     const { execFile } = require('child_process');
     console.log('[token] Token expired, running claude CLI to refresh...');
-    execFile('claude', ['-p', 'ping', '--max-turns', '1', '--no-session-persistence'], { timeout: 30000, env: { ...process.env, PATH: process.env.PATH + ':/home/ubuntu/.local/bin' } }, (err) => {
+    execFile(bin, ['-p', 'ping', '--max-turns', '1', '--no-session-persistence'], { timeout: 30000 }, (err) => {
       refreshInProgress = null;
-      if (err) { reject(new Error(`claude refresh failed: ${err.message}`)); return; }
+      if (err) {
+        console.log('[token] refresh failed:', err.message);
+        reject(err);
+        return;
+      }
       console.log('[token] CLI refresh done');
       resolve();
     });
@@ -814,7 +837,7 @@ function startServer(config) {
         if (isFinite(pre.expiresAt) && pre.expiresAt - Date.now() < 60000) {
           await refreshOAuthToken();
         }
-      } catch (e) { console.log('[token] refresh failed:', e.message); }
+      } catch (_) {}
       let body = Buffer.concat(chunks);
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
