@@ -738,6 +738,142 @@ function reverseMap(text, config) {
   return r;
 }
 
+function createSseEventTransformer(config) {
+  let currentBlockIsThinking = false;
+  const streamState = new Map(); // key "index:field" -> raw, un-emitted buffer
+
+  // Every literal string reverseMap() searches for. reverseMap() rewrites tool
+  // and property names in BOTH plain ("Name") and JSON-escaped (\"Name\") form,
+  // so both variants are patterns whose prefix could appear at a buffer tail.
+  const patterns = [];
+  for (const [, cc] of config.toolRenames) {
+    patterns.push('"' + cc + '"', '\\"' + cc + '\\"');
+  }
+  for (const [, renamed] of config.propRenames) {
+    patterns.push('"' + renamed + '"', '\\"' + renamed + '\\"');
+  }
+  for (const [sanitized] of config.reverseMap) {
+    patterns.push(sanitized);
+  }
+  const maxPatternLen = patterns.reduce((m, p) => Math.max(m, p.length), 1);
+
+  // Streaming reverse-map. reverseMap() only rewrites COMPLETE patterns, so a
+  // pattern split across SSE delta events (".ocpla" then "tform") would be
+  // emitted raw before it completes and could never be retracted. Hold back
+  // the trailing raw bytes that might still grow into a pattern, emit only the
+  // safe prefix, and carry the rest to the next delta (or the stop flush).
+  function streamReverse(key, value, isFinal) {
+    const buf = (streamState.get(key) || '') + value;
+    let cut;
+    if (isFinal) {
+      cut = buf.length;
+    } else {
+      // A pattern is at most maxPatternLen long, so anything before this point
+      // cannot be the start of a still-incomplete pattern.
+      cut = Math.max(0, buf.length - (maxPatternLen - 1));
+      // ...but a *complete* occurrence may straddle that point. Pull the cut
+      // back to its start so the whole occurrence stays in the carry buffer.
+      let moved = true;
+      while (moved) {
+        moved = false;
+        for (const p of patterns) {
+          let idx = buf.indexOf(p);
+          while (idx !== -1 && idx < cut) {
+            if (idx + p.length > cut) { cut = idx; moved = true; }
+            idx = buf.indexOf(p, idx + 1);
+          }
+        }
+      }
+    }
+    const carry = buf.slice(cut);
+    if (carry) streamState.set(key, carry); else streamState.delete(key);
+    return reverseMap(buf.slice(0, cut), config);
+  }
+
+  function buildDeltaEvent(index, field, value) {
+    const delta = field === 'partial_json'
+      ? { type: 'input_json_delta', partial_json: value }
+      : { type: 'text_delta', text: value };
+    return 'event: content_block_delta\ndata: ' +
+      JSON.stringify({ type: 'content_block_delta', index, delta }) + '\n\n';
+  }
+
+  // Emit whatever is still held for a block as synthetic delta event(s).
+  // Called on content_block_stop (and flushAll) — the block has no more deltas,
+  // so the held tail must come out now or it is lost.
+  function flushBlock(index) {
+    let out = '';
+    for (const field of ['text', 'partial_json']) {
+      const key = index + ':' + field;
+      if (!streamState.has(key)) continue;
+      const rest = streamReverse(key, '', true);
+      if (rest) out += buildDeltaEvent(index, field, rest);
+    }
+    return out;
+  }
+
+  const transform = (event) => {
+    let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+    if (dataIdx === -1) return reverseMap(event, config);
+    if (dataIdx > 0) dataIdx += 1;
+    const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+    const dataStr = dataLineEnd === -1
+      ? event.slice(dataIdx + 6)
+      : event.slice(dataIdx + 6, dataLineEnd);
+
+    let payload;
+    try {
+      payload = JSON.parse(dataStr);
+    } catch (_) {
+      return reverseMap(event, config);
+    }
+
+    if (payload.type === 'content_block_start') {
+      const t = payload.content_block && payload.content_block.type;
+      if (t === 'thinking' || t === 'redacted_thinking') {
+        currentBlockIsThinking = true;
+        return event;
+      }
+      currentBlockIsThinking = false;
+      return reverseMap(event, config);
+    }
+    if (payload.type === 'content_block_stop') {
+      const wasThinking = currentBlockIsThinking;
+      currentBlockIsThinking = false;
+      if (wasThinking) return event;
+      const flushed = typeof payload.index === 'number' ? flushBlock(payload.index) : '';
+      return flushed + reverseMap(event, config);
+    }
+    if (currentBlockIsThinking) return event;
+
+    if (payload.type === 'content_block_delta' && payload.delta && typeof payload.index === 'number') {
+      if (payload.delta.type === 'input_json_delta' && typeof payload.delta.partial_json === 'string') {
+        payload.delta.partial_json = streamReverse(payload.index + ':partial_json', payload.delta.partial_json, false);
+      } else if (payload.delta.type === 'text_delta' && typeof payload.delta.text === 'string') {
+        payload.delta.text = streamReverse(payload.index + ':text', payload.delta.text, false);
+      } else {
+        return reverseMap(event, config);
+      }
+      const rewritten = JSON.stringify(payload);
+      return event.slice(0, dataIdx + 6) + rewritten + (dataLineEnd === -1 ? '' : event.slice(dataLineEnd));
+    }
+
+    return reverseMap(event, config);
+  };
+
+  // Flush any buffer left when the stream ends without a content_block_stop
+  // (malformed stream). Well-formed streams flush per block on stop.
+  transform.flushAll = () => {
+    let out = '';
+    const indices = new Set();
+    for (const key of streamState.keys()) indices.add(Number(key.slice(0, key.indexOf(':'))));
+    for (const index of indices) out += flushBlock(index);
+    return out;
+  };
+
+  return transform;
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -861,38 +997,7 @@ function startServer(config) {
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
-          let currentBlockIsThinking = false;
-
-          const transformEvent = (event) => {
-            // Locate the data: line (always at the start of an SSE line)
-            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
-            if (dataIdx > 0) dataIdx += 1; // skip the leading \n
-            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
-              ? event.slice(dataIdx + 6)
-              : event.slice(dataIdx + 6, dataLineEnd);
-
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event; // pass through unchanged
-              }
-              currentBlockIsThinking = false;
-              return reverseMap(event, config);
-            }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
-            }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
-            }
-            return reverseMap(event, config);
-          };
+          const transformEvent = createSseEventTransformer(config);
 
           upRes.on('data', (chunk) => {
             pending += decoder.write(chunk);
@@ -910,6 +1015,8 @@ function startServer(config) {
               // well-formed SSE, but flush to avoid silent drops.
               res.write(transformEvent(pending));
             }
+            // Flush any buffer held for a block that never got a stop event.
+            res.write(transformEvent.flushAll());
             res.end();
           });
         } else {
@@ -974,6 +1081,31 @@ function startServer(config) {
   process.on('SIGTERM', () => process.exit(0));
 }
 
+function applySseReverseMapChunks(chunks, config) {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let out = '';
+  const transformEvent = createSseEventTransformer(config);
+
+  for (const chunk of chunks) {
+    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    let sepIdx;
+    while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+      const event = pending.slice(0, sepIdx + 2);
+      pending = pending.slice(sepIdx + 2);
+      out += transformEvent(event);
+    }
+  }
+  pending += decoder.end();
+  if (pending.length > 0) out += transformEvent(pending);
+  out += transformEvent.flushAll();
+  return out;
+}
+
+module.exports = { loadConfig, reverseMap, applySseReverseMapChunks };
+
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+if (require.main === module) {
+  const config = loadConfig();
+  startServer(config);
+}
