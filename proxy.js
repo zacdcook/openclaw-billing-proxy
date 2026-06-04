@@ -468,6 +468,28 @@ function findMatchingBracket(str, start) {
 const THINK_MASK_PREFIX = '__OBP_THINK_MASK_';
 const THINK_MASK_SUFFIX = '__';
 const THINK_BLOCK_PATTERNS = ['{"type":"thinking"', '{"type":"redacted_thinking"'];
+const TOOL_INPUT_MASK_PREFIX = '__OBP_TOOL_INPUT_MASK_';
+const TOOL_INPUT_MASK_SUFFIX = '__';
+
+function findMatchingObject(str, start) {
+  if (str[start] !== '{') return -1;
+  let depth = 0, inStr = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
 
 function maskThinkingBlocks(m) {
   const masks = [];
@@ -516,13 +538,77 @@ function unmaskThinkingBlocks(m, masks) {
   return m;
 }
 
+function maskToolUseInputs(m) {
+  const masks = [];
+  let out = '';
+  let i = 0;
+
+  while (i < m.length) {
+    const typeIdx = m.indexOf('"type":"tool_use"', i);
+    if (typeIdx === -1) { out += m.slice(i); break; }
+
+    const objStart = m.lastIndexOf('{', typeIdx);
+    if (objStart === -1 || objStart < i) {
+      out += m.slice(i, typeIdx + 1);
+      i = typeIdx + 1;
+      continue;
+    }
+
+    const objEnd = findMatchingObject(m, objStart);
+    if (objEnd === -1) {
+      out += m.slice(i);
+      break;
+    }
+
+    const obj = m.slice(objStart, objEnd + 1);
+    const inputKey = '"input":';
+    const inputIdx = obj.indexOf(inputKey);
+    if (inputIdx === -1) {
+      out += m.slice(i, objEnd + 1);
+      i = objEnd + 1;
+      continue;
+    }
+
+    let valueStart = inputIdx + inputKey.length;
+    while (valueStart < obj.length && /\s/.test(obj[valueStart])) valueStart++;
+    if (obj[valueStart] !== '{') {
+      out += m.slice(i, objEnd + 1);
+      i = objEnd + 1;
+      continue;
+    }
+
+    const valueEnd = findMatchingObject(obj, valueStart);
+    if (valueEnd === -1) {
+      out += m.slice(i, objEnd + 1);
+      i = objEnd + 1;
+      continue;
+    }
+
+    const mask = TOOL_INPUT_MASK_PREFIX + masks.length + TOOL_INPUT_MASK_SUFFIX;
+    masks.push(obj.slice(valueStart, valueEnd + 1));
+    const maskedObj = obj.slice(0, valueStart) + mask + obj.slice(valueEnd + 1);
+    out += m.slice(i, objStart) + maskedObj;
+    i = objEnd + 1;
+  }
+
+  return { masked: out, masks };
+}
+
+function unmaskToolUseInputs(m, masks) {
+  for (let i = 0; i < masks.length; i++) {
+    m = m.split(TOOL_INPUT_MASK_PREFIX + i + TOOL_INPUT_MASK_SUFFIX).join(masks[i]);
+  }
+  return m;
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking content blocks from the transform pipeline
   // so Layer 2/3/6 split/join can't mutate assistant history. Restored before
   // return. See "Thinking Block Protection" above.
   const { masked: maskedBody, masks: thinkMasks } = maskThinkingBlocks(bodyStr);
-  let m = maskedBody;
+  const { masked: maskedWithToolInputs, masks: toolInputMasks } = maskToolUseInputs(maskedBody);
+  let m = maskedWithToolInputs;
 
   // Layer 2: String trigger sanitization (global split/join)
   for (const [find, replace] of config.replacements) {
@@ -710,6 +796,7 @@ function processBody(bodyStr, config) {
     }
   }
 
+  m = unmaskToolUseInputs(m, toolInputMasks);
   return unmaskThinkingBlocks(m, thinkMasks);
 }
 
@@ -843,14 +930,13 @@ function startServer(config) {
           return;
         }
         // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
-        // event arrives (terminated by \n\n), then transform per event. This
-        // subsumes the older tail-buffer fix for patterns split across TCP
-        // chunks (#11) because SSE events are self-contained, so patterns
-        // can't span event boundaries. It also lets us track the current
-        // content block type across events and pass thinking/redacted_thinking
-        // bytes through unchanged — Anthropic rejects the next turn otherwise
-        // with "thinking blocks in the latest assistant message cannot be
-        // modified."
+        // event arrives (terminated by \n\n). Tool input_json_delta fragments
+        // are accumulated for the current tool_use block and reverse-mapped as
+        // one partial_json string before content_block_stop, because Anthropic
+        // can split values like .ocplatform across arbitrary delta events.
+        // Thinking/redacted_thinking bytes still pass through unchanged —
+        // Anthropic rejects the next turn otherwise with "thinking blocks in
+        // the latest assistant message cannot be modified."
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
@@ -862,36 +948,87 @@ function startServer(config) {
           const decoder = new StringDecoder('utf8');
           let pending = '';
           let currentBlockIsThinking = false;
+          let currentBlockIsToolUse = false;
+          let bufferedToolInput = '';
+          let bufferedToolIndex = 0;
 
-          const transformEvent = (event) => {
-            // Locate the data: line (always at the start of an SSE line)
+          const getDataStr = (event) => {
             let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
+            if (dataIdx === -1) return null;
             if (dataIdx > 0) dataIdx += 1; // skip the leading \n
             const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
+            return dataLineEnd === -1
               ? event.slice(dataIdx + 6)
               : event.slice(dataIdx + 6, dataLineEnd);
+          };
 
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
+          const writeMappedEvent = (event) => {
+            res.write(reverseMap(event, config));
+          };
+
+          const flushBufferedToolInput = () => {
+            if (!currentBlockIsToolUse || bufferedToolInput.length === 0) return;
+            const mappedPartial = reverseMap(bufferedToolInput, config);
+            const event = 'data: ' + JSON.stringify({
+              type: 'content_block_delta',
+              index: bufferedToolIndex,
+              delta: { type: 'input_json_delta', partial_json: mappedPartial }
+            }) + '\n\n';
+            res.write(event);
+            bufferedToolInput = '';
+          };
+
+          const handleEvent = (event) => {
+            const dataStr = getDataStr(event);
+            if (dataStr === null) {
+              writeMappedEvent(event);
+              return;
+            }
+
+            let data = null;
+            try { data = JSON.parse(dataStr); } catch (e) {}
+
+            if (data && data.type === 'content_block_start') {
+              const blockType = data.content_block && data.content_block.type;
+              if (blockType === 'thinking' || blockType === 'redacted_thinking') {
                 currentBlockIsThinking = true;
-                return event; // pass through unchanged
+                currentBlockIsToolUse = false;
+                bufferedToolInput = '';
+                res.write(event); // pass through unchanged
+                return;
               }
               currentBlockIsThinking = false;
-              return reverseMap(event, config);
+              currentBlockIsToolUse = blockType === 'tool_use';
+              bufferedToolInput = '';
+              bufferedToolIndex = typeof data.index === 'number' ? data.index : 0;
+              writeMappedEvent(event);
+              return;
             }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+
+            if (data && data.type === 'content_block_delta' && currentBlockIsToolUse &&
+                data.delta && data.delta.type === 'input_json_delta') {
+              bufferedToolInput += data.delta.partial_json || '';
+              return;
+            }
+
+            if (data && data.type === 'content_block_stop') {
               const wasThinking = currentBlockIsThinking;
+              flushBufferedToolInput();
               currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
+              currentBlockIsToolUse = false;
+              bufferedToolInput = '';
+              if (wasThinking) res.write(event);
+              else writeMappedEvent(event);
+              return;
             }
+
             if (currentBlockIsThinking) {
               // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
+              res.write(event);
+              return;
             }
-            return reverseMap(event, config);
+
+            writeMappedEvent(event);
           };
 
           upRes.on('data', (chunk) => {
@@ -900,7 +1037,7 @@ function startServer(config) {
             while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
               const event = pending.slice(0, sepIdx + 2);
               pending = pending.slice(sepIdx + 2);
-              res.write(transformEvent(event));
+              handleEvent(event);
             }
           });
           upRes.on('end', () => {
@@ -908,8 +1045,9 @@ function startServer(config) {
             if (pending.length > 0) {
               // Trailing bytes with no terminator — shouldn't happen in
               // well-formed SSE, but flush to avoid silent drops.
-              res.write(transformEvent(pending));
+              handleEvent(pending);
             }
+            flushBufferedToolInput();
             res.end();
           });
         } else {
@@ -975,5 +1113,18 @@ function startServer(config) {
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+if (require.main === module) {
+  const config = loadConfig();
+  startServer(config);
+}
+
+module.exports = {
+  DEFAULT_REPLACEMENTS,
+  DEFAULT_REVERSE_MAP,
+  DEFAULT_TOOL_RENAMES,
+  DEFAULT_PROP_RENAMES,
+  processBody,
+  reverseMap,
+  maskToolUseInputs,
+  unmaskToolUseInputs
+};
