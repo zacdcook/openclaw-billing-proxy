@@ -738,6 +738,259 @@ function reverseMap(text, config) {
   return r;
 }
 
+// ─── Raw-string SSE field codec ─────────────────────────────────────────────
+// The SSE reverse path must NOT JSON.parse/stringify whole event payloads: a full
+// round-trip would normalize bytes the proxy never meant to touch (\uXXXX -> literal,
+// \/ -> /, number/whitespace/key-order normalization) across the ENTIRE event,
+// breaking thinking-block byte-equality and busting prompt caching. Instead we locate
+// just the one string field we must reverse, decode that value, reverse it, and
+// re-encode it back in place.
+//
+// Byte-fidelity therefore holds exactly where it matters: every byte OUTSIDE the
+// reversed field passes through untouched, and thinking/redacted_thinking blocks are
+// never decoded at all. The reversed value ITSELF is decoded and re-encoded, so within
+// that one value \uXXXX/\/ are re-emitted in canonical form (logical content preserved,
+// not byte-identical to upstream) — which is fine because it is not a thinking block.
+
+// Locate a JSON string field's value. Returns {start,end}: CHAR offsets into the JS
+// string (used directly with String.prototype.slice — these are UTF-16 char indices,
+// NOT byte offsets; do not add byte<->char conversion). `start` is just inside the
+// opening quote, `end` is at the closing quote. Escape-aware (skips \" etc.). Null if absent.
+function findSseStringField(s, field) {
+  const key = '"' + field + '":"';
+  const k = s.indexOf(key);
+  if (k === -1) return null;
+  const start = k + key.length;
+  let i = start;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '"') return { start, end: i };
+    i++;
+  }
+  return null;
+}
+
+// Read an integer-valued field (e.g. "index":3) without parsing the object.
+function extractSseIntField(s, field) {
+  const key = '"' + field + '":';
+  const k = s.indexOf(key);
+  if (k === -1) return null;
+  let i = k + key.length;
+  while (i < s.length && s[i] === ' ') i++;
+  const start = i;
+  if (s[i] === '-') i++;
+  const digitsAt = i;
+  while (i < s.length && s[i] >= '0' && s[i] <= '9') i++;
+  if (i === digitsAt) return null;
+  return parseInt(s.slice(start, i), 10);
+}
+
+// Decode a JSON string body (the bytes between the quotes) to real characters.
+// Each SSE event carries a COMPLETE, valid JSON string, so escape sequences are
+// never split within one event (only the logical value is fragmented across
+// events), and this never has to handle a truncated escape.
+function jsonStringDecode(s) {
+  if (s.indexOf('\\') === -1) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c !== '\\') { out += c; continue; }
+    const n = s[i + 1];
+    switch (n) {
+      case '"': out += '"'; i++; break;
+      case '\\': out += '\\'; i++; break;
+      case '/': out += '/'; i++; break;
+      case 'b': out += '\b'; i++; break;
+      case 'f': out += '\f'; i++; break;
+      case 'n': out += '\n'; i++; break;
+      case 'r': out += '\r'; i++; break;
+      case 't': out += '\t'; i++; break;
+      // \uXXXX: 4 hex digits live at i+2..i+6; advance i by 5 (+1 from the loop = past all 6 chars)
+      case 'u': out += String.fromCharCode(parseInt(s.slice(i + 2, i + 6), 16)); i += 5; break;
+      default: out += c; // malformed; keep the backslash literally
+    }
+  }
+  return out;
+}
+
+// Re-encode characters into a JSON string body. Matches JSON.stringify escaping
+// (escape ", \, control chars; leave / and non-ASCII literal) and additionally
+// escapes LONE surrogates as \uXXXX, so a value cut between a surrogate pair still
+// survives UTF-8 transport and reassembles correctly when the client concatenates.
+function jsonStringEncode(s) {
+  if (!/[\\"\u0000-\u001F\uD800-\uDFFF]/.test(s)) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    const code = s.charCodeAt(i);
+    if (c === '"') { out += '\\"'; continue; }
+    if (c === '\\') { out += '\\\\'; continue; }
+    if (code < 0x20) {
+      switch (c) {
+        case '\b': out += '\\b'; break;
+        case '\f': out += '\\f'; break;
+        case '\n': out += '\\n'; break;
+        case '\r': out += '\\r'; break;
+        case '\t': out += '\\t'; break;
+        default: out += '\\u' + code.toString(16).padStart(4, '0');
+      }
+      continue;
+    }
+    if (code >= 0xD800 && code <= 0xDBFF) { // high surrogate
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) { out += c + s[i + 1]; i++; } // valid pair -> literal
+      else out += '\\u' + code.toString(16).padStart(4, '0');           // lone high -> escape
+      continue;
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) { // lone low surrogate -> escape
+      out += '\\u' + code.toString(16).padStart(4, '0');
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+function createSseEventTransformer(config) {
+  let currentBlockIsThinking = false;
+  const streamState = new Map(); // key "index:field" -> raw, un-emitted buffer
+
+  // Every literal string reverseMap() searches for. reverseMap() rewrites tool
+  // and property names in BOTH plain ("Name") and JSON-escaped (\"Name\") form,
+  // so both variants are patterns whose prefix could appear at a buffer tail.
+  const patterns = [];
+  for (const [, cc] of config.toolRenames) {
+    patterns.push('"' + cc + '"', '\\"' + cc + '\\"');
+  }
+  for (const [, renamed] of config.propRenames) {
+    patterns.push('"' + renamed + '"', '\\"' + renamed + '\\"');
+  }
+  for (const [sanitized] of config.reverseMap) {
+    patterns.push(sanitized);
+  }
+  const maxPatternLen = patterns.reduce((m, p) => Math.max(m, p.length), 1);
+
+  // Streaming reverse-map. reverseMap() only rewrites COMPLETE patterns, so a
+  // pattern split across SSE delta events (".ocpla" then "tform") would be
+  // emitted raw before it completes and could never be retracted. Hold back
+  // the trailing raw bytes that might still grow into a pattern, emit only the
+  // safe prefix, and carry the rest to the next delta (or the stop flush).
+  function streamReverse(key, value, isFinal) {
+    const buf = (streamState.get(key) || '') + value;
+    let cut;
+    if (isFinal) {
+      cut = buf.length;
+    } else {
+      // A pattern is at most maxPatternLen long, so anything before this point
+      // cannot be the start of a still-incomplete pattern.
+      cut = Math.max(0, buf.length - (maxPatternLen - 1));
+      // ...but a *complete* occurrence may straddle that point. Pull the cut
+      // back to its start so the whole occurrence stays in the carry buffer.
+      let moved = true;
+      while (moved) {
+        moved = false;
+        for (const p of patterns) {
+          let idx = buf.indexOf(p);
+          while (idx !== -1 && idx < cut) {
+            if (idx + p.length > cut) { cut = idx; moved = true; }
+            idx = buf.indexOf(p, idx + 1);
+          }
+        }
+      }
+    }
+    const carry = buf.slice(cut);
+    if (carry) streamState.set(key, carry); else streamState.delete(key);
+    return reverseMap(buf.slice(0, cut), config);
+  }
+
+  function buildDeltaEvent(index, field, value) {
+    const inner = field === 'partial_json'
+      ? '{"type":"input_json_delta","partial_json":"' + jsonStringEncode(value) + '"}'
+      : '{"type":"text_delta","text":"' + jsonStringEncode(value) + '"}';
+    return 'event: content_block_delta\ndata: {"type":"content_block_delta","index":' +
+      index + ',"delta":' + inner + '}\n\n';
+  }
+
+  // Emit whatever is still held for a block as synthetic delta event(s).
+  // Called on content_block_stop (and flushAll) — the block has no more deltas,
+  // so the held tail must come out now or it is lost.
+  function flushBlock(index) {
+    let out = '';
+    for (const field of ['text', 'partial_json']) {
+      const key = index + ':' + field;
+      if (!streamState.has(key)) continue;
+      const rest = streamReverse(key, '', true);
+      if (rest) out += buildDeltaEvent(index, field, rest);
+    }
+    return out;
+  }
+
+  const transform = (event) => {
+    let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+    if (dataIdx === -1) return reverseMap(event, config);
+    if (dataIdx > 0) dataIdx += 1;
+    const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+    const dataStr = dataLineEnd === -1
+      ? event.slice(dataIdx + 6)
+      : event.slice(dataIdx + 6, dataLineEnd);
+
+    // Raw-string event classification (NO JSON.parse): these markers only ever
+    // appear unescaped at the envelope level; an escaped occurrence inside a
+    // string value carries \" and cannot match.
+    if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
+      if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
+          dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
+        currentBlockIsThinking = true;
+        return event;
+      }
+      currentBlockIsThinking = false;
+      return reverseMap(event, config);
+    }
+    if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+      const wasThinking = currentBlockIsThinking;
+      currentBlockIsThinking = false;
+      if (wasThinking) return event;
+      const index = extractSseIntField(dataStr, 'index');
+      const flushed = index !== null ? flushBlock(index) : '';
+      return flushed + reverseMap(event, config);
+    }
+    if (currentBlockIsThinking) return event;
+
+    if (dataStr.indexOf('"type":"content_block_delta"') !== -1) {
+      let field = null;
+      if (dataStr.indexOf('"type":"input_json_delta"') !== -1) field = 'partial_json';
+      else if (dataStr.indexOf('"type":"text_delta"') !== -1) field = 'text';
+      if (field === null) return reverseMap(event, config);
+
+      const index = extractSseIntField(dataStr, 'index');
+      const loc = findSseStringField(dataStr, field);
+      if (index === null || loc === null) return reverseMap(event, config);
+
+      // Decode just this field's value, stream-reverse it, re-encode it in place;
+      // every other byte of the event passes through untouched.
+      const decoded = jsonStringDecode(dataStr.slice(loc.start, loc.end));
+      const reversed = jsonStringEncode(streamReverse(index + ':' + field, decoded, false));
+      const newDataStr = dataStr.slice(0, loc.start) + reversed + dataStr.slice(loc.end);
+      return event.slice(0, dataIdx + 6) + newDataStr + (dataLineEnd === -1 ? '' : event.slice(dataLineEnd));
+    }
+
+    return reverseMap(event, config);
+  };
+
+  // Flush any buffer left when the stream ends without a content_block_stop
+  // (malformed stream). Well-formed streams flush per block on stop.
+  transform.flushAll = () => {
+    let out = '';
+    const indices = new Set();
+    for (const key of streamState.keys()) indices.add(Number(key.slice(0, key.indexOf(':'))));
+    for (const index of indices) out += flushBlock(index);
+    return out;
+  };
+
+  return transform;
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -861,38 +1114,7 @@ function startServer(config) {
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
-          let currentBlockIsThinking = false;
-
-          const transformEvent = (event) => {
-            // Locate the data: line (always at the start of an SSE line)
-            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
-            if (dataIdx > 0) dataIdx += 1; // skip the leading \n
-            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
-              ? event.slice(dataIdx + 6)
-              : event.slice(dataIdx + 6, dataLineEnd);
-
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event; // pass through unchanged
-              }
-              currentBlockIsThinking = false;
-              return reverseMap(event, config);
-            }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
-            }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
-            }
-            return reverseMap(event, config);
-          };
+          const transformEvent = createSseEventTransformer(config);
 
           upRes.on('data', (chunk) => {
             pending += decoder.write(chunk);
@@ -910,6 +1132,8 @@ function startServer(config) {
               // well-formed SSE, but flush to avoid silent drops.
               res.write(transformEvent(pending));
             }
+            // Flush any buffer held for a block that never got a stop event.
+            res.write(transformEvent.flushAll());
             res.end();
           });
         } else {
@@ -974,6 +1198,34 @@ function startServer(config) {
   process.on('SIGTERM', () => process.exit(0));
 }
 
+function applySseReverseMapChunks(chunks, config) {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let out = '';
+  const transformEvent = createSseEventTransformer(config);
+
+  for (const chunk of chunks) {
+    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    let sepIdx;
+    while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+      const event = pending.slice(0, sepIdx + 2);
+      pending = pending.slice(sepIdx + 2);
+      out += transformEvent(event);
+    }
+  }
+  pending += decoder.end();
+  if (pending.length > 0) out += transformEvent(pending);
+  out += transformEvent.flushAll();
+  return out;
+}
+
+module.exports = {
+  loadConfig, reverseMap, applySseReverseMapChunks,
+  jsonStringDecode, jsonStringEncode, findSseStringField, extractSseIntField,
+};
+
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+if (require.main === module) {
+  const config = loadConfig();
+  startServer(config);
+}
