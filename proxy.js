@@ -36,6 +36,11 @@ const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.1.0';
 const DEFAULT_TRANSFORM_WORKERS = Math.max(2, Math.min(4, os.cpus()?.length || 2));
+const DEFAULT_MAX_TRANSFORM_QUEUE = 64;
+const REQUEST_SIZE_WARN_BYTES = 1 * 1024 * 1024;
+const REQUEST_SIZE_HIGH_BYTES = 2 * 1024 * 1024;
+const REQUEST_SIZE_CRITICAL_BYTES = 5 * 1024 * 1024;
+const USAGE_LOG_DEFAULT_NAME = 'billing-proxy-usage.jsonl';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -350,15 +355,18 @@ function loadConfig() {
   return {
     port: port || config.port || DEFAULT_PORT,
     credsPath,
-    replacements: [...DEFAULT_REPLACEMENTS, ...(config.replacements || [])],
-    reverseMap: [...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])],
-    toolRenames: [...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])],
-    propRenames: [...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])],
+    replacements: dedupePairs([...DEFAULT_REPLACEMENTS, ...(config.replacements || [])]),
+    reverseMap: dedupePairs([...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])]),
+    toolRenames: dedupePairs([...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])]),
+    propRenames: dedupePairs([...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])]),
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
-    transformWorkers: normalizeTransformWorkers(config.transformWorkers)
+    transformWorkers: normalizeTransformWorkers(config.transformWorkers),
+    maxTransformQueue: normalizeMaxTransformQueue(config.maxTransformQueue),
+    usageLogEnabled: config.usageLogEnabled !== false,
+    usageLogPath: resolveUsageLogPath(config.usageLogPath, homeDir)
   };
 }
 
@@ -375,6 +383,217 @@ function normalizeTransformWorkers(value) {
   if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_TRANSFORM_WORKERS;
   return Math.floor(parsed);
 }
+
+function normalizeMaxTransformQueue(value) {
+  if (value === undefined || value === null) return DEFAULT_MAX_TRANSFORM_QUEUE;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_TRANSFORM_QUEUE;
+  return Math.floor(parsed);
+}
+
+function dedupePairs(pairs) {
+  const seen = new Set();
+  const out = [];
+  for (const pair of pairs || []) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const key = JSON.stringify([pair[0], pair[1]]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(pair);
+  }
+  return out;
+}
+
+function nowMs() {
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
+function formatMs(ms) {
+  return `${Math.max(0, Math.round(ms))}ms`;
+}
+
+
+function hashShort(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+}
+
+function resolveUsageLogPath(configPath, homeDir = os.homedir()) {
+  if (configPath === false || configPath === null) return null;
+  const p = expandHome(configPath || path.join(homeDir, '.openclaw', 'logs', USAGE_LOG_DEFAULT_NAME), homeDir);
+  return path.resolve(p);
+}
+
+function approxContentChars(content) {
+  if (typeof content === 'string') return content.length;
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (typeof part.text === 'string') total += part.text.length;
+    if (typeof part.content === 'string') total += part.content.length;
+  }
+  return total;
+}
+
+function countContentParts(content, type) {
+  if (!Array.isArray(content)) return 0;
+  return content.filter(part => part && part.type === type).length;
+}
+
+function extractRequestMetadata(bodyStr, headers = {}) {
+  const meta = {
+    parseOk: false,
+    model: parseRequestModel(bodyStr),
+    stream: null,
+    maxTokens: null,
+    thinkingBudgetTokens: null,
+    messagesCount: null,
+    toolsCount: null,
+    systemChars: 0,
+    messageContentChars: 0,
+    userMessages: 0,
+    assistantMessages: 0,
+    toolUseBlocks: 0,
+    toolResultBlocks: 0,
+    firstUserHash: null,
+    lastUserHash: null,
+    bodyHash: hashShort(bodyStr)
+  };
+
+  const attributionHeaderNames = [
+    'x-openclaw-agent-id', 'x-openclaw-session-key', 'x-openclaw-session-id',
+    'x-openclaw-run-id', 'x-openclaw-cron-job-id', 'x-openclaw-task-id'
+  ];
+  const attribution = {};
+  for (const name of attributionHeaderNames) {
+    const value = headers[name] || headers[name.toLowerCase()];
+    if (value) attribution[name] = hashShort(value);
+  }
+  if (Object.keys(attribution).length) meta.attributionHeaderHashes = attribution;
+
+  try {
+    const parsed = JSON.parse(bodyStr);
+    meta.parseOk = true;
+    meta.model = parsed.model || meta.model;
+    meta.stream = Boolean(parsed.stream);
+    meta.maxTokens = parsed.max_tokens ?? parsed.maxTokens ?? null;
+    meta.thinkingBudgetTokens = parsed.thinking?.budget_tokens ?? parsed.thinking?.budgetTokens ?? null;
+    meta.toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 0;
+    meta.systemChars = typeof parsed.system === 'string'
+      ? parsed.system.length
+      : Array.isArray(parsed.system)
+        ? parsed.system.reduce((sum, part) => sum + approxContentChars(part?.text ?? part?.content ?? ''), 0)
+        : 0;
+
+    const toolNames = Array.isArray(parsed.tools) ? parsed.tools.map(t => t?.name).filter(Boolean) : [];
+    if (toolNames.length) meta.toolNamesHash = hashShort(toolNames.join('\n'));
+
+    if (Array.isArray(parsed.messages)) {
+      meta.messagesCount = parsed.messages.length;
+      let firstUser = null;
+      let lastUser = null;
+      for (const msg of parsed.messages) {
+        if (!msg || typeof msg !== 'object') continue;
+        if (msg.role === 'user') meta.userMessages++;
+        if (msg.role === 'assistant') meta.assistantMessages++;
+        meta.messageContentChars += approxContentChars(msg.content);
+        meta.toolUseBlocks += countContentParts(msg.content, 'tool_use');
+        meta.toolResultBlocks += countContentParts(msg.content, 'tool_result');
+        if (msg.role === 'user') {
+          const chars = approxContentChars(msg.content);
+          const marker = `${chars}:${JSON.stringify(msg.content).slice(0, 256)}`;
+          if (!firstUser) firstUser = marker;
+          lastUser = marker;
+        }
+      }
+      meta.firstUserHash = hashShort(firstUser);
+      meta.lastUserHash = hashShort(lastUser);
+    }
+  } catch (_) {
+    // Keep string-scanned fields above. Never log raw body content on parse failure.
+  }
+  return meta;
+}
+
+function ensureUsageLogDir(config) {
+  if (!config.usageLogEnabled || !config.usageLogPath) return;
+  fs.mkdirSync(path.dirname(config.usageLogPath), { recursive: true });
+}
+
+function appendUsageLog(config, entry) {
+  if (!config.usageLogEnabled || !config.usageLogPath) return;
+  try {
+    fs.appendFileSync(config.usageLogPath, JSON.stringify(entry) + '\n');
+  } catch (e) {
+    console.error(`[${new Date().toISOString().substring(11, 19)}] usage-log write failed: ${e.message}`);
+  }
+}
+
+function summarizeUsageLog(config, options = {}) {
+  if (!config.usageLogEnabled || !config.usageLogPath || !fs.existsSync(config.usageLogPath)) {
+    return { enabled: Boolean(config.usageLogEnabled), path: config.usageLogPath || null, entries: 0 };
+  }
+  const maxLines = Math.max(1, Math.min(Number(options.lines) || 5000, 50000));
+  const rawLines = fs.readFileSync(config.usageLogPath, 'utf8').trim().split(/\n+/).slice(-maxLines);
+  const byMinute = new Map();
+  const byModel = new Map();
+  const byEvent = new Map();
+  const largeRequests = [];
+  let parsed = 0;
+  for (const line of rawLines) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch (_) { continue; }
+    parsed++;
+    const minute = entry.ts ? entry.ts.slice(0, 16) : 'unknown';
+    const event = entry.event || 'unknown';
+    const model = entry.model || entry.request?.model || 'unknown';
+    const bytes = Number(entry.originalBytes || 0);
+    byEvent.set(event, (byEvent.get(event) || 0) + 1);
+    byModel.set(model, (byModel.get(model) || 0) + (event === 'request' ? 1 : 0));
+    if (event === 'request') {
+      const bucket = byMinute.get(minute) || { minute, requests: 0, originalBytes: 0, transformedBytes: 0, warn: 0, high: 0, critical: 0, models: {} };
+      bucket.requests++;
+      bucket.originalBytes += bytes;
+      bucket.transformedBytes += Number(entry.transformedBytes || 0);
+      if (entry.sizeLevel === 'WARN') bucket.warn++;
+      if (entry.sizeLevel === 'HIGH') bucket.high++;
+      if (entry.sizeLevel === 'CRITICAL') bucket.critical++;
+      bucket.models[model] = (bucket.models[model] || 0) + 1;
+      byMinute.set(minute, bucket);
+      if (bytes >= REQUEST_SIZE_WARN_BYTES) {
+        largeRequests.push({ ts: entry.ts, reqNum: entry.reqNum, model, originalBytes: bytes, transformedBytes: entry.transformedBytes, sizeLevel: entry.sizeLevel, request: entry.request });
+      }
+    }
+  }
+  const topMinutes = [...byMinute.values()].sort((a, b) => b.requests - a.requests).slice(0, 20);
+  const recentMinutes = [...byMinute.values()].sort((a, b) => a.minute.localeCompare(b.minute)).slice(-60);
+  return {
+    enabled: true,
+    path: config.usageLogPath,
+    sampledLines: rawLines.length,
+    parsedEntries: parsed,
+    eventCounts: Object.fromEntries([...byEvent.entries()].sort((a, b) => b[1] - a[1])),
+    modelRequestCounts: Object.fromEntries([...byModel.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])),
+    topMinutes,
+    recentMinutes,
+    largeRequests: largeRequests.slice(-100)
+  };
+}
+
+function requestSizeLevel(bytes) {
+  if (bytes >= REQUEST_SIZE_CRITICAL_BYTES) return 'CRITICAL';
+  if (bytes >= REQUEST_SIZE_HIGH_BYTES) return 'HIGH';
+  if (bytes >= REQUEST_SIZE_WARN_BYTES) return 'WARN';
+  return null;
+}
+
+function parseRequestModel(bodyStr) {
+  const match = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+  return match ? match[1] : 'unknown';
+}
+
 
 function parseCredentialPayload(raw) {
   if (!raw) return null;
@@ -770,8 +989,9 @@ function upstreamRetryDelayMs(attempt) {
 
 // ─── Transform Worker Pool ──────────────────────────────────────────────────
 class TransformWorkerPool {
-  constructor(size) {
+  constructor(size, maxQueue = DEFAULT_MAX_TRANSFORM_QUEUE) {
     this.size = Math.max(0, size || 0);
+    this.maxQueue = normalizeMaxTransformQueue(maxQueue);
     this.workers = [];
     this.queue = [];
     this.nextId = 1;
@@ -831,6 +1051,9 @@ class TransformWorkerPool {
 
   run(type, payload) {
     if (this.closed) return Promise.reject(new Error('transform worker pool is closed'));
+    if (this.queue.length >= this.maxQueue) {
+      return Promise.reject(new Error(`transform worker queue saturated (${this.queue.length}/${this.maxQueue})`));
+    }
     return new Promise((resolve, reject) => {
       this.queue.push({
         id: this.nextId++,
@@ -864,7 +1087,8 @@ class TransformWorkerPool {
       enabled: this.size > 0,
       workers: this.workers.length,
       busy: this.workers.filter(w => w.busy).length,
-      queued: this.queue.length
+      queued: this.queue.length,
+      maxQueue: this.maxQueue
     };
   }
 
@@ -879,28 +1103,58 @@ class TransformWorkerPool {
   }
 }
 
-function createTransformPool(size) {
+function createTransformPool(size, maxQueue) {
   const workers = normalizeTransformWorkers(size);
-  return workers > 0 ? new TransformWorkerPool(workers) : null;
+  return workers > 0 ? new TransformWorkerPool(workers, maxQueue) : null;
 }
 
-async function runProcessBody(bodyStr, config, transformPool) {
-  if (!transformPool) return processBody(bodyStr, config);
-  return transformPool.run('processBody', { bodyStr, config });
+async function runProcessBody(bodyStr, config, transformPool, reqNum = '?') {
+  const started = nowMs();
+  const beforeStats = transformPool ? transformPool.stats() : null;
+  const result = transformPool
+    ? await transformPool.run('processBody', { bodyStr, config })
+    : await processBody(bodyStr, config);
+  const elapsed = nowMs() - started;
+  if (elapsed >= 250 || bodyStr.length >= REQUEST_SIZE_WARN_BYTES) {
+    const queueInfo = beforeStats ? ` workers=${beforeStats.busy}/${beforeStats.workers} queued=${beforeStats.queued}/${beforeStats.maxQueue}` : ' workers=inline';
+    console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} transform processBody ${formatMs(elapsed)}${queueInfo}`);
+  }
+  return result;
 }
 
-async function runReverseMap(text, config, transformPool) {
-  if (!transformPool) return reverseMap(text, config);
-  return transformPool.run('reverseMap', { text, config });
+async function runReverseMap(text, config, transformPool, reqNum = '?') {
+  const started = nowMs();
+  const result = transformPool
+    ? await transformPool.run('reverseMap', { text, config })
+    : reverseMap(text, config);
+  const elapsed = nowMs() - started;
+  if (elapsed >= 250 || text.length >= REQUEST_SIZE_WARN_BYTES) {
+    console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} transform reverseMap ${formatMs(elapsed)} bytes=${text.length}`);
+  }
+  return result;
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
   const startedAt = Date.now();
-  const transformPool = createTransformPool(config.transformWorkers);
+  const transformPool = createTransformPool(config.transformWorkers, config.maxTransformQueue);
+  ensureUsageLogDir(config);
 
   const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url && req.url.startsWith('/usage-summary')) {
+      try {
+        const u = new URL(req.url, `http://127.0.0.1:${config.port}`);
+        const summary = summarizeUsageLog(config, { lines: u.searchParams.get('lines') });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(summary, null, 2));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', message: e.message }));
+      }
+      return;
+    }
+
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
@@ -912,9 +1166,10 @@ function startServer(config) {
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
+          usageLog: config.usageLogEnabled ? config.usageLogPath : null,
           tokenExpiresInHours: expiresIn.toFixed(1),
           subscriptionType: oauth.subscriptionType,
-          transformPool: transformPool ? transformPool.stats() : { enabled: false, workers: 0, busy: 0, queued: 0 },
+          transformPool: transformPool ? transformPool.stats() : { enabled: false, workers: 0, busy: 0, queued: 0, maxQueue: 0 },
           layers: {
             stringReplacements: config.replacements.length,
             toolNameRenames: config.toolRenames.length,
@@ -934,6 +1189,7 @@ function startServer(config) {
     requestCount++;
     const reqNum = requestCount;
     const chunks = [];
+    const requestStartedAt = nowMs();
 
     req.on('data', c => chunks.push(c));
     req.on('end', async () => {
@@ -947,14 +1203,17 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      const OVERSIZE_WARN = 4 * 1024 * 1024;
-      if (originalSize > OVERSIZE_WARN) {
-        console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} [OVERSIZE] request body ${originalSize}b > ${OVERSIZE_WARN}b — transcript cap may not be holding; large bodies can stall the event loop`);
+      const requestMeta = extractRequestMetadata(bodyStr, req.headers);
+      const requestModel = requestMeta.model;
+      const sizeLevel = requestSizeLevel(originalSize);
+      if (sizeLevel) {
+        console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} [SIZE-${sizeLevel}] request body ${originalSize}b model=${requestModel}; large bodies can stall transforms or signal weak compaction`);
       }
       try {
-        bodyStr = await runProcessBody(bodyStr, config, transformPool);
+        bodyStr = await runProcessBody(bodyStr, config, transformPool, reqNum);
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
+        appendUsageLog(config, { ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'processBody_error', durationMs: nowMs() - requestStartedAt, originalBytes: originalSize, model: requestModel, error: e.message, request: requestMeta });
         res.end(JSON.stringify({ type: 'error', error: { message: 'processBody failed: ' + e.message } }));
         return;
       }
@@ -985,7 +1244,11 @@ function startServer(config) {
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} model=${requestModel} (${originalSize}b -> ${body.length}b)`);
+      appendUsageLog(config, {
+        ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'request',
+        model: requestModel, originalBytes: originalSize, transformedBytes: body.length, sizeLevel, request: requestMeta
+      });
 
       let completed = false;
 
@@ -1006,6 +1269,7 @@ function startServer(config) {
           const status = upRes.statusCode;
           const attemptSuffix = attempt > 1 ? ` attempt=${attempt}/${MAX_UPSTREAM_ATTEMPTS}` : '';
           console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} > ${status}${attemptSuffix}`);
+          appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_headers', status, attempt, durationMs: nowMs() - requestStartedAt });
           if (status !== 200 && status !== 201) {
             const errChunks = [];
             upRes.on('data', c => errChunks.push(c));
@@ -1013,10 +1277,12 @@ function startServer(config) {
               (async () => {
                 if (completed) return;
                 let errBody = Buffer.concat(errChunks).toString();
-                if (errBody.includes('extra usage')) {
+                const detection = errBody.includes('extra usage');
+                if (detection) {
                   console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} DETECTION! Body: ${body.length}b`);
                 }
-                errBody = await runReverseMap(errBody, config, transformPool);
+                appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_error_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(errBody), detection });
+                errBody = await runReverseMap(errBody, config, transformPool, reqNum);
                 const nh = { ...upRes.headers };
                 nh['content-length'] = Buffer.byteLength(errBody);
                 completed = true;
@@ -1024,16 +1290,23 @@ function startServer(config) {
                 res.end(errBody);
               })().catch(e => fail(502, e.message));
             });
-            upRes.on('error', e => fail(502, e.message));
+            upRes.on('error', e => {
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_response_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
+              fail(502, e.message);
+            });
             return;
           }
           if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
             completed = true;
             res.writeHead(status, upRes.headers);
             upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
-            upRes.on('end', () => res.end());
+            upRes.on('end', () => {
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_end', status, attempt, durationMs: nowMs() - requestStartedAt });
+              res.end();
+            });
             upRes.on('error', e => {
               console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} STREAM ERR: ${e.message}`);
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
               if (!res.destroyed) res.end();
             });
           } else {
@@ -1043,15 +1316,19 @@ function startServer(config) {
               (async () => {
                 if (completed) return;
                 let respBody = Buffer.concat(respChunks).toString();
-                respBody = await runReverseMap(respBody, config, transformPool);
+                respBody = await runReverseMap(respBody, config, transformPool, reqNum);
                 const nh = { ...upRes.headers };
                 nh['content-length'] = Buffer.byteLength(respBody);
+                appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(respBody) });
                 completed = true;
                 res.writeHead(status, nh);
                 res.end(respBody);
               })().catch(e => fail(502, e.message));
             });
-            upRes.on('error', e => fail(502, e.message));
+            upRes.on('error', e => {
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_response_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
+              fail(502, e.message);
+            });
           }
         });
         upstream.on('error', e => {
@@ -1060,10 +1337,12 @@ function startServer(config) {
             const delay = upstreamRetryDelayMs(attempt);
             const code = e.code ? ` code=${e.code}` : '';
             console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} RETRY ${attempt + 1}/${MAX_UPSTREAM_ATTEMPTS} after ${e.message}${code} in ${delay}ms`);
+            appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'retry', attempt, nextAttempt: attempt + 1, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null, delayMs: delay });
             setTimeout(() => sendUpstream(attempt + 1), delay);
             return;
           }
           console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} ERR: ${e.message}`);
+          appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_error', attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
           fail(502, e.message);
         });
         upstream.write(body);
@@ -1091,9 +1370,11 @@ function startServer(config) {
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
       console.log(`  Transform workers: ${transformPool ? transformPool.stats().workers : 'disabled'}`);
+      console.log(`  Max transform queue: ${transformPool ? transformPool.stats().maxQueue : 0}`);
       console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
+      console.log(`  Usage log:         ${config.usageLogEnabled ? config.usageLogPath : 'disabled'}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
