@@ -299,8 +299,8 @@ const DEFAULT_PROP_RENAMES = [
 const DEFAULT_REVERSE_MAP = [
   ['OCPlatform', 'OpenClaw'],
   ['ocplatform', 'openclaw'],
-  ['OCRoute', 'OCPlatform'],
-  ['ocroute', 'ocplatform'],
+  ['OCRoute', 'OpenClaw'],
+  ['ocroute', 'openclaw'],
   ['create_task', 'sessions_spawn'],
   ['list_tasks', 'sessions_list'],
   ['get_history', 'sessions_history'],
@@ -1014,8 +1014,8 @@ function reverseMap(text, config) {
 function canonicalizeWorkspacePaths(text) {
   const homeDir = os.homedir();
   return text
-    .split(`${homeDir}/.ocplatform/workspace`).join(`${homeDir}/.openclaw/workspace`)
-    .split('~/.ocplatform/workspace').join('~/.openclaw/workspace')
+    .split(`${homeDir}/.ocplatform`).join(`${homeDir}/.openclaw`)
+    .split('~/.ocplatform').join('~/.openclaw')
     .split(`${homeDir}/.hermes/claude-code`).join(`${homeDir}/.hermes/hermes-agent`)
     .split('~/.hermes/claude-code').join('~/.hermes/hermes-agent');
 }
