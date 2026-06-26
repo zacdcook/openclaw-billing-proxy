@@ -3,6 +3,7 @@
   "credentialsPath": "~/.claude/.credentials.json",
   "transformWorkers": 4,
   "maxTransformQueue": 64,
+  "bodyPreviewChars": 160,
 
   "stripSystemConfig": true,
   "stripToolDescriptions": true,

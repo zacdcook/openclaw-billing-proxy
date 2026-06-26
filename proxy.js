@@ -164,6 +164,8 @@ function getStainlessHeaders() {
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
+  ['OCPlatform', 'OCRoute'],
+  ['ocplatform', 'ocroute'],
   ['OpenClaw', 'OCPlatform'],
   ['openclaw', 'ocplatform'],
   ['Hermes Agent', 'Claude Code'],
@@ -297,6 +299,8 @@ const DEFAULT_PROP_RENAMES = [
 const DEFAULT_REVERSE_MAP = [
   ['OCPlatform', 'OpenClaw'],
   ['ocplatform', 'openclaw'],
+  ['OCRoute', 'OCPlatform'],
+  ['ocroute', 'ocplatform'],
   ['create_task', 'sessions_spawn'],
   ['list_tasks', 'sessions_list'],
   ['get_history', 'sessions_history'],
@@ -365,6 +369,7 @@ function loadConfig() {
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
     transformWorkers: normalizeTransformWorkers(config.transformWorkers),
     maxTransformQueue: normalizeMaxTransformQueue(config.maxTransformQueue),
+    bodyPreviewChars: normalizeBodyPreviewChars(config.bodyPreviewChars),
     usageLogEnabled: config.usageLogEnabled !== false,
     usageLogPath: resolveUsageLogPath(config.usageLogPath, homeDir)
   };
@@ -389,6 +394,13 @@ function normalizeMaxTransformQueue(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_TRANSFORM_QUEUE;
   return Math.floor(parsed);
+}
+
+function normalizeBodyPreviewChars(value) {
+  if (value === undefined || value === null || value === false) return 0;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return 0;
+  return Math.min(Math.floor(parsed), 500);
 }
 
 function dedupePairs(pairs) {
@@ -436,12 +448,36 @@ function approxContentChars(content) {
   return total;
 }
 
+function contentPreview(content, maxChars) {
+  if (!maxChars) return null;
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .map(part => {
+        if (!part || typeof part !== 'object') return '';
+        if (typeof part.text === 'string') return part.text;
+        if (typeof part.content === 'string') return part.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join(' ');
+  }
+  if (!text) return null;
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+  return normalized.length > maxChars
+    ? `${normalized.slice(0, maxChars)}...`
+    : normalized;
+}
+
 function countContentParts(content, type) {
   if (!Array.isArray(content)) return 0;
   return content.filter(part => part && part.type === type).length;
 }
 
-function extractRequestMetadata(bodyStr, headers = {}) {
+function extractRequestMetadata(bodyStr, headers = {}, previewChars = 0) {
   const meta = {
     parseOk: false,
     model: parseRequestModel(bodyStr),
@@ -458,6 +494,8 @@ function extractRequestMetadata(bodyStr, headers = {}) {
     toolResultBlocks: 0,
     firstUserHash: null,
     lastUserHash: null,
+    firstUserPreview: null,
+    lastUserPreview: null,
     bodyHash: hashShort(bodyStr)
   };
 
@@ -493,6 +531,8 @@ function extractRequestMetadata(bodyStr, headers = {}) {
       meta.messagesCount = parsed.messages.length;
       let firstUser = null;
       let lastUser = null;
+      let firstUserPreview = null;
+      let lastUserPreview = null;
       for (const msg of parsed.messages) {
         if (!msg || typeof msg !== 'object') continue;
         if (msg.role === 'user') meta.userMessages++;
@@ -503,12 +543,17 @@ function extractRequestMetadata(bodyStr, headers = {}) {
         if (msg.role === 'user') {
           const chars = approxContentChars(msg.content);
           const marker = `${chars}:${JSON.stringify(msg.content).slice(0, 256)}`;
+          const preview = contentPreview(msg.content, previewChars);
           if (!firstUser) firstUser = marker;
+          if (!firstUserPreview) firstUserPreview = preview;
           lastUser = marker;
+          lastUserPreview = preview;
         }
       }
       meta.firstUserHash = hashShort(firstUser);
       meta.lastUserHash = hashShort(lastUser);
+      meta.firstUserPreview = firstUserPreview;
+      meta.lastUserPreview = lastUserPreview;
     }
   } catch (_) {
     // Keep string-scanned fields above. Never log raw body content on parse failure.
@@ -966,6 +1011,174 @@ function reverseMap(text, config) {
   return r;
 }
 
+// Strict SSE reverse mapping buffers a full streamed response and rewrites
+// logical Anthropic delta streams before forwarding them. This catches cases
+// where a sanitized token is split across separate text_delta or partial_json
+// events, e.g. ".oc" + "platform/...".
+function pathKey(pathParts) {
+  return pathParts.map(String).join('\x1f');
+}
+
+function getPathValue(obj, pathParts) {
+  let current = obj;
+  for (const part of pathParts) {
+    if (!current || typeof current !== 'object') return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function setPathValue(obj, pathParts, value) {
+  let current = obj;
+  for (let i = 0; i < pathParts.length - 1; i++) current = current[pathParts[i]];
+  current[pathParts[pathParts.length - 1]] = value;
+}
+
+function reverseJsonStrings(value, config, skipPaths, currentPath = []) {
+  if (typeof value === 'string') return reverseMap(value, config);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const childPath = currentPath.concat(i);
+      if (!skipPaths.has(pathKey(childPath))) {
+        value[i] = reverseJsonStrings(value[i], config, skipPaths, childPath);
+      }
+    }
+    return value;
+  }
+  if (value && typeof value === 'object') {
+    for (const key of Object.keys(value)) {
+      const childPath = currentPath.concat(key);
+      if (!skipPaths.has(pathKey(childPath))) {
+        value[key] = reverseJsonStrings(value[key], config, skipPaths, childPath);
+      }
+    }
+  }
+  return value;
+}
+
+function addSseFragmentCapture(groups, skipPaths, obj, groupKey, pathParts) {
+  const value = getPathValue(obj, pathParts);
+  if (typeof value !== 'string') return;
+  if (!groups.has(groupKey)) groups.set(groupKey, []);
+  groups.get(groupKey).push({ obj, pathParts, value });
+  skipPaths.add(pathKey(pathParts));
+}
+
+function captureSseDeltaFragments(obj, groups, skipPaths) {
+  if (!obj || typeof obj !== 'object') return;
+
+  if (obj.type === 'content_block_delta' && obj.delta && typeof obj.delta === 'object') {
+    const index = obj.index ?? 0;
+    if (obj.delta.type === 'text_delta') {
+      addSseFragmentCapture(groups, skipPaths, obj, `text:${index}`, ['delta', 'text']);
+    } else if (obj.delta.type === 'input_json_delta') {
+      addSseFragmentCapture(groups, skipPaths, obj, `input_json:${index}`, ['delta', 'partial_json']);
+    }
+  }
+
+  // Legacy/compat streaming shape.
+  if (typeof obj.completion === 'string') {
+    addSseFragmentCapture(groups, skipPaths, obj, 'completion', ['completion']);
+  }
+}
+
+function redistributeSseFragments(groups, config) {
+  for (const refs of groups.values()) {
+    if (!refs.length) continue;
+    const transformed = reverseMap(refs.map(ref => ref.value).join(''), config);
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i];
+      setPathValue(ref.obj, ref.pathParts, i === 0 ? transformed : '');
+    }
+  }
+}
+
+function parseSseFrames(text) {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const blocks = normalized.split('\n\n');
+  const frames = [];
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    if (!block && i === blocks.length - 1) continue;
+    if (!block) {
+      frames.push({ raw: '\n\n' });
+      continue;
+    }
+
+    const complete = i < blocks.length - 1 || normalized.endsWith('\n\n');
+    const lines = block.split('\n');
+    const dataIndexes = [];
+    const dataParts = [];
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex];
+      if (!line.startsWith('data:')) continue;
+      dataIndexes.push(lineIndex);
+      let data = line.slice('data:'.length);
+      if (data.startsWith(' ')) data = data.slice(1);
+      dataParts.push(data);
+    }
+
+    frames.push({
+      raw: block + (complete ? '\n\n' : ''),
+      lines,
+      dataIndexes,
+      data: dataParts.join('\n'),
+      dataObj: null
+    });
+  }
+
+  return frames;
+}
+
+function renderSseFrame(frame) {
+  if (!frame.lines || !frame.dataIndexes.length || !frame.dataObj) return frame.raw;
+
+  const dataLines = JSON.stringify(frame.dataObj).split('\n').map(line => `data: ${line}`);
+  const out = [];
+  let insertedData = false;
+  const dataIndexSet = new Set(frame.dataIndexes);
+
+  for (let i = 0; i < frame.lines.length; i++) {
+    if (!dataIndexSet.has(i)) {
+      out.push(frame.lines[i]);
+      continue;
+    }
+    if (!insertedData) {
+      out.push(...dataLines);
+      insertedData = true;
+    }
+  }
+
+  return out.join('\n') + '\n\n';
+}
+
+function transformSseResponse(text, config) {
+  const frames = parseSseFrames(text);
+  const groups = new Map();
+
+  for (const frame of frames) {
+    if (!frame.dataIndexes || !frame.dataIndexes.length) continue;
+    const trimmed = frame.data.trim();
+    if (!trimmed || trimmed === '[DONE]') continue;
+
+    try {
+      frame.dataObj = JSON.parse(frame.data);
+    } catch (_) {
+      frame.raw = reverseMap(frame.raw, config);
+      continue;
+    }
+
+    const skipPaths = new Set();
+    captureSseDeltaFragments(frame.dataObj, groups, skipPaths);
+    reverseJsonStrings(frame.dataObj, config, skipPaths);
+  }
+
+  redistributeSseFragments(groups, config);
+
+  return frames.map(renderSseFrame).join('');
+}
+
 // ─── Upstream Retry Handling ─────────────────────────────────────────────────
 const MAX_UPSTREAM_ATTEMPTS = 3;
 const RETRYABLE_UPSTREAM_ERROR_CODES = new Set([
@@ -1203,7 +1416,7 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      const requestMeta = extractRequestMetadata(bodyStr, req.headers);
+      const requestMeta = extractRequestMetadata(bodyStr, req.headers, config.bodyPreviewChars);
       const requestModel = requestMeta.model;
       const sizeLevel = requestSizeLevel(originalSize);
       if (sizeLevel) {
@@ -1245,6 +1458,9 @@ function startServer(config) {
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} model=${requestModel} (${originalSize}b -> ${body.length}b)`);
+      if (config.bodyPreviewChars && (requestMeta.firstUserPreview || requestMeta.lastUserPreview)) {
+        console.log(`[${ts}] #${reqNum} body-preview first=${JSON.stringify(requestMeta.firstUserPreview)} last=${JSON.stringify(requestMeta.lastUserPreview)}`);
+      }
       appendUsageLog(config, {
         ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'request',
         model: requestModel, originalBytes: originalSize, transformedBytes: body.length, sizeLevel, request: requestMeta
@@ -1297,17 +1513,32 @@ function startServer(config) {
             return;
           }
           if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-            completed = true;
-            res.writeHead(status, upRes.headers);
-            upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
+            const streamChunks = [];
+            upRes.on('data', c => streamChunks.push(c));
             upRes.on('end', () => {
-              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_end', status, attempt, durationMs: nowMs() - requestStartedAt });
-              res.end();
+              try {
+                if (completed) return;
+                let streamBody = Buffer.concat(streamChunks).toString();
+                streamBody = transformSseResponse(streamBody, config);
+                const nh = { ...upRes.headers };
+                delete nh['transfer-encoding'];
+                nh['content-length'] = Buffer.byteLength(streamBody);
+                appendUsageLog(config, {
+                  ts: new Date().toISOString(), reqNum, event: 'stream_end',
+                  status, attempt, durationMs: nowMs() - requestStartedAt,
+                  responseBytes: Buffer.byteLength(streamBody), strictSseReverse: true
+                });
+                completed = true;
+                res.writeHead(status, nh);
+                res.end(streamBody);
+              } catch (e) {
+                fail(502, e.message);
+              }
             });
             upRes.on('error', e => {
               console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} STREAM ERR: ${e.message}`);
               appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
-              if (!res.destroyed) res.end();
+              fail(502, e.message);
             });
           } else {
             const respChunks = [];
@@ -1418,6 +1649,7 @@ module.exports = {
   loadConfig,
   processBody,
   reverseMap,
+  transformSseResponse,
   createTransformPool,
   runProcessBody,
   runReverseMap,
