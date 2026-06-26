@@ -38,7 +38,7 @@ import platform
 from urllib.parse import urlparse, parse_qs
 
 # --- Defaults ----------------------------------------------------------------
-DEFAULT_PORT = 18801
+DEFAULT_PORT = 18802
 UPSTREAM_HOST = "api.anthropic.com"
 VERSION = "2.1.0"
 REQUEST_SIZE_WARN_BYTES = 1 * 1024 * 1024
