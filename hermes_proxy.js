@@ -1080,7 +1080,16 @@ function reverseMap(text, config) {
   for (const [sanitized, original] of config.reverseMap) {
     r = r.split(sanitized).join(original);
   }
-  return r;
+  return canonicalizePathAliases(r);
+}
+
+function canonicalizePathAliases(text) {
+  const homeDir = os.homedir();
+  return text
+    .split(`${homeDir}/.ocplatform/workspace`).join(`${homeDir}/.openclaw/workspace`)
+    .split('~/.ocplatform/workspace').join('~/.openclaw/workspace')
+    .split(`${homeDir}/.hermes/claude-code`).join(`${homeDir}/.hermes/hermes-agent`)
+    .split('~/.hermes/claude-code').join('~/.hermes/hermes-agent');
 }
 
 function reverseJsonStringValue(text, config) {
@@ -1100,7 +1109,7 @@ function reverseJsonStringValue(text, config) {
   for (const [sanitized, original] of config.reverseMap) {
     r = r.split(sanitized).join(original);
   }
-  return r;
+  return canonicalizePathAliases(r);
 }
 
 // Strict SSE reverse mapping buffers a full streamed response and rewrites

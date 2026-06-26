@@ -1015,7 +1015,9 @@ function canonicalizeWorkspacePaths(text) {
   const homeDir = os.homedir();
   return text
     .split(`${homeDir}/.ocplatform/workspace`).join(`${homeDir}/.openclaw/workspace`)
-    .split('~/.ocplatform/workspace').join('~/.openclaw/workspace');
+    .split('~/.ocplatform/workspace').join('~/.openclaw/workspace')
+    .split(`${homeDir}/.hermes/claude-code`).join(`${homeDir}/.hermes/hermes-agent`)
+    .split('~/.hermes/claude-code').join('~/.hermes/hermes-agent');
 }
 
 function reverseJsonStringValue(text, config) {
