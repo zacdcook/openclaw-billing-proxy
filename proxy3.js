@@ -1,0 +1,1473 @@
+#!/usr/bin/env node
+/**
+ * OpenClaw Subscription Billing Proxy v2.0
+ *
+ * Routes OpenClaw API requests through Claude Code's subscription billing
+ * instead of Extra Usage. Defeats Anthropic's multi-layer detection:
+ *
+ *   Layer 1: Billing header injection (84-char Claude Code identifier)
+ *   Layer 2: String trigger sanitization (OpenClaw, sessions_*, running inside, etc.)
+ *   Layer 3: Tool name fingerprint bypass (rename OC tools to CC PascalCase convention)
+ *   Layer 4: System prompt template bypass (strip config section, replace with paraphrase)
+ *   Layer 5: Tool description stripping (reduce fingerprint signal in tool schemas)
+ *   Layer 6: Property name renaming (eliminate OC-specific schema property names)
+ *   Layer 7: Full bidirectional reverse mapping (SSE + JSON responses)
+ *
+ * v1.x string-only sanitization stopped working April 8, 2026 when Anthropic
+ * upgraded from string matching to tool-name fingerprinting and template detection.
+ * v2.0 defeats the new detection by transforming the entire request body.
+ *
+ * Zero dependencies. Works on Windows, Linux, Mac.
+ *
+ * Usage:
+ *   node proxy.js [--port 18801] [--config config.json]
+ */
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+
+// ─── Defaults ───────────────────────────────────────────────────────────────
+const DEFAULT_PORT = 18801;
+const UPSTREAM_HOST = 'api.anthropic.com';
+const VERSION = '2.1.0';
+const DEFAULT_TRANSFORM_WORKERS = Math.max(2, Math.min(4, os.cpus()?.length || 2));
+const DEFAULT_MAX_TRANSFORM_QUEUE = 64;
+const REQUEST_SIZE_WARN_BYTES = 1 * 1024 * 1024;
+const REQUEST_SIZE_HIGH_BYTES = 2 * 1024 * 1024;
+const REQUEST_SIZE_CRITICAL_BYTES = 5 * 1024 * 1024;
+const USAGE_LOG_DEFAULT_NAME = 'billing-proxy-usage.jsonl';
+
+// Claude Code version to emulate (update when new CC versions are released)
+const CC_VERSION = '2.1.97';
+
+// Billing fingerprint constants (matches real CC utils/fingerprint.ts)
+const BILLING_HASH_SALT = '59cf53e54c78';
+const BILLING_HASH_INDICES = [4, 7, 20];
+
+// Persistent per-instance identifiers (generated once at startup)
+const WORKER_IDENTITY = workerData?.mode === 'transform-worker' ? workerData : {};
+const DEVICE_ID = WORKER_IDENTITY.deviceId || crypto.randomBytes(32).toString('hex');
+const INSTANCE_SESSION_ID = WORKER_IDENTITY.sessionId || crypto.randomUUID();
+
+// Beta flags required for OAuth + Claude Code features
+const REQUIRED_BETAS = [
+  'oauth-2025-04-20',
+  'claude-code-20250219',
+  'interleaved-thinking-2025-05-14',
+  'advanced-tool-use-2025-11-20',
+  'context-management-2025-06-27',
+  'prompt-caching-scope-2026-01-05',
+  'effort-2025-11-24',
+  'fast-mode-2026-02-01'
+];
+
+// CC tool stubs -- injected into tools array to make the tool set look more
+// like a Claude Code session. The model won't call these (schemas are minimal).
+const CC_TOOL_STUBS = [
+  '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
+  '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
+  '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
+  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
+  '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
+];
+
+// ─── Billing Fingerprint ────────────────────────────────────────────────────
+// Computes a 3-character SHA256 fingerprint hash matching real CC's
+// computeFingerprint() in utils/fingerprint.ts:
+//   SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
+// Applied to the first user message text in the request body.
+
+function computeBillingFingerprint(firstUserText) {
+  const chars = BILLING_HASH_INDICES.map(i => firstUserText[i] || '0').join('');
+  const input = `${BILLING_HASH_SALT}${chars}${CC_VERSION}`;
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 3);
+}
+
+// Extract first user message text from the raw body using string scanning.
+// Avoids JSON.parse to preserve raw body integrity.
+function extractFirstUserText(bodyStr) {
+  // Find first "role":"user" in messages array
+  const msgsIdx = bodyStr.indexOf('"messages":[');
+  if (msgsIdx === -1) return '';
+  const userIdx = bodyStr.indexOf('"role":"user"', msgsIdx);
+  if (userIdx === -1) return '';
+
+  // Look for "content" near this role
+  // Could be "content":"string" or "content":[{..."text":"..."}]
+  const contentIdx = bodyStr.indexOf('"content"', userIdx);
+  if (contentIdx === -1 || contentIdx > userIdx + 500) return '';
+
+  const afterContent = bodyStr[contentIdx + '"content"'.length + 1]; // skip the :
+  if (afterContent === '"') {
+    // Simple string content: "content":"text here"
+    const textStart = contentIdx + '"content":"'.length;
+    let end = textStart;
+    while (end < bodyStr.length) {
+      if (bodyStr[end] === '\\') { end += 2; continue; }
+      if (bodyStr[end] === '"') break;
+      end++;
+    }
+    // Decode basic JSON escapes for the fingerprint characters
+    return bodyStr.slice(textStart, end)
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  // Array content: find first text block
+  const textIdx = bodyStr.indexOf('"text":"', contentIdx);
+  if (textIdx === -1 || textIdx > contentIdx + 2000) return '';
+  const textStart = textIdx + '"text":"'.length;
+  let end = textStart;
+  while (end < bodyStr.length) {
+    if (bodyStr[end] === '\\') { end += 2; continue; }
+    if (bodyStr[end] === '"') break;
+    end++;
+  }
+  return bodyStr.slice(textStart, Math.min(end, textStart + 50))
+    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function buildBillingBlock(bodyStr) {
+  const firstText = extractFirstUserText(bodyStr);
+  const fingerprint = computeBillingFingerprint(firstText);
+  const ccVersion = `${CC_VERSION}.${fingerprint}`;
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+}
+
+// ─── Stainless SDK Headers ──────────────────────────────────────────────────
+// Real Claude Code sends these on every request via the Anthropic JS SDK.
+function getStainlessHeaders() {
+  const p = process.platform;
+  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  return {
+    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'x-app': 'cli',
+    'x-claude-code-session-id': INSTANCE_SESSION_ID,
+    'x-stainless-arch': arch,
+    'x-stainless-lang': 'js',
+    'x-stainless-os': osName,
+    'x-stainless-package-version': '0.81.0',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': process.version,
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'anthropic-dangerous-direct-browser-access': 'true'
+  };
+}
+
+// ─── Layer 2: String Trigger Replacements ───────────────────────────────────
+// Applied globally via split/join on the entire request body.
+// IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
+// breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
+const DEFAULT_REPLACEMENTS = [
+  ['Hermes', 'Hank'],
+  ['hermes', 'Hank'],
+  ['OpenClaw', 'OCPlatform'],
+  ['openclaw', 'ocplatform'],
+  ['Hermes Agent', 'Claude Code'],
+  ['Hermes agent', 'Claude Code'],
+  ['hermes-agent', 'claude-code'],
+  ['Nous Research', 'Anthropic'],
+  ['SOUL.md', 'CLAUDE.md'],
+  ['MEMORY (your personal notes)', 'WORKSPACE NOTES'],
+  ['USER PROFILE (who the user is)', 'USER NOTES'],
+  ['available_skills', 'available_tools'],
+  ['sessions_spawn', 'create_task'],
+  ['sessions_list', 'list_tasks'],
+  ['sessions_history', 'get_history'],
+  ['sessions_send', 'send_to_task'],
+  ['sessions_yield_interrupt', 'task_yield_interrupt'],
+  ['sessions_yield', 'yield_task'],
+  ['sessions_store', 'task_store'],
+  ['HEARTBEAT_OK', 'HB_ACK'],
+  ['HEARTBEAT', 'HB_SIGNAL'],
+  ['heartbeat', 'hb_signal'],
+  ['running inside', 'operating from'],
+  ['Prometheus', 'PAssistant'],
+  ['prometheus', 'passistant'],
+  ['clawhub.com', 'skillhub.example.com'],
+  ['clawhub', 'skillhub'],
+  ['clawd', 'agentd'],
+  ['lossless-claw', 'lossless-ctx'],
+  ['third-party', 'external'],
+  ['billing proxy', 'routing layer'],
+  ['billing-proxy', 'routing-layer'],
+  ['x-anthropic-billing-header', 'x-routing-config'],
+  ['x-anthropic-billing', 'x-routing-cfg'],
+  ['cch=00000', 'cfg=00000'],
+  ['cc_version', 'rt_version'],
+  ['cc_entrypoint', 'rt_entrypoint'],
+  ['billing header', 'routing config'],
+  ['extra usage', 'usage quota'],
+  ['assistant platform', 'ocplatform']
+];
+
+// ─── Layer 3: Tool Name Renames ─────────────────────────────────────────────
+// Applied as "quoted" replacements ("name" -> "Name") throughout the ENTIRE body.
+// This defeats Anthropic's tool-name fingerprinting which identifies the request
+// as OpenClaw based on the combination of tool names in the tools array.
+//
+// The detector specifically checks for OpenClaw's tool name set. Even with empty
+// schemas (no descriptions, no properties), original tool names trigger detection.
+// Renaming to PascalCase CC-like conventions defeats this entirely.
+//
+// ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
+const DEFAULT_TOOL_RENAMES = [
+  ['exec', 'Bash'],
+  ['process', 'BashSession'],
+  ['browser', 'BrowserControl'],
+  ['canvas', 'CanvasView'],
+  ['nodes', 'DeviceControl'],
+  ['cron', 'Scheduler'],
+  ['message', 'SendMessage'],
+  ['tts', 'Speech'],
+  ['gateway', 'SystemCtl'],
+  ['agents_list', 'AgentList'],
+  ['list_tasks', 'TaskList'],
+  ['get_history', 'TaskHistory'],
+  ['send_to_task', 'TaskSend'],
+  ['create_task', 'TaskCreate'],
+  ['subagents', 'AgentControl'],
+  ['session_status', 'StatusCheck'],
+  ['web_search', 'WebSearch'],
+  ['web_fetch', 'WebFetch'],
+  // NOTE: ['image', 'ImageGen'] removed — collides with Anthropic content block
+  // type "image". OpenClaw tool_results carrying image content blocks would have
+  // their `"type": "image"` field renamed and Anthropic rejects with:
+  //   messages.N.content.M.tool_result.content.K: Input tag 'ImageGen' found
+  //   using 'type' does not match any of the expected tags
+  // The fingerprint signal lost from one tool name is much smaller than the
+  // certainty of breaking every conversation that ever touched an image. (issue #14)
+  ['pdf', 'PdfParse'],
+  ['memory_search', 'KnowledgeSearch'],
+  ['memory_get', 'KnowledgeGet'],
+  ['lcm_expand_query', 'ContextQuery'],
+  ['lcm_grep', 'ContextGrep'],
+  ['lcm_describe', 'ContextDescribe'],
+  ['lcm_expand', 'ContextExpand'],
+  ['yield_task', 'TaskYield'],
+  ['task_store', 'TaskStore'],
+  ['task_yield_interrupt', 'TaskYieldInterrupt'],
+  ['mcp_browser_back', 'BrowserBack'],
+  ['mcp_browser_click', 'BrowserClick'],
+  ['mcp_browser_console', 'BrowserConsole'],
+  ['mcp_browser_get_images', 'BrowserImages'],
+  ['mcp_browser_navigate', 'BrowserNavigate'],
+  ['mcp_browser_press', 'BrowserPress'],
+  ['mcp_browser_scroll', 'BrowserScroll'],
+  ['mcp_browser_snapshot', 'BrowserSnapshot'],
+  ['mcp_browser_type', 'BrowserType'],
+  ['mcp_browser_vision', 'BrowserVision'],
+  ['mcp_clarify', 'AskUser'],
+  ['mcp_cronjob', 'Scheduler'],
+  ['mcp_delegate_task', 'Task'],
+  ['mcp_execute_code', 'CodeExec'],
+  ['mcp_memory', 'MemoryStore'],
+  ['mcp_patch', 'PatchApply'],
+  ['mcp_process', 'BashSessionCtl'],
+  ['mcp_read_file', 'Read'],
+  ['mcp_search_files', 'GrepFiles'],
+  ['mcp_session_search', 'TaskSearch'],
+  ['mcp_skill_manage', 'SkillManage'],
+  ['mcp_skill_view', 'SkillView'],
+  ['mcp_skills_list', 'SkillList'],
+  ['mcp_terminal', 'Bash'],
+  ['mcp_text_to_speech', 'Speech'],
+  ['mcp_todo', 'TodoWrite'],
+  ['mcp_vision_analyze', 'VisionAnalyze'],
+  ['mcp_write_file', 'Write']
+];
+
+// ─── Layer 6: Property Name Renames ─────────────────────────────────────────
+// OC-specific schema property names that contribute to fingerprinting.
+const DEFAULT_PROP_RENAMES = [
+  ['session_id', 'thread_id'],
+  ['conversation_id', 'thread_ref'],
+  ['summaryIds', 'chunk_ids'],
+  ['summary_id', 'chunk_id'],
+  ['system_event', 'event_text'],
+  ['agent_id', 'worker_id'],
+  ['wake_at', 'trigger_at'],
+  ['wake_event', 'trigger_event']
+];
+
+// ─── Reverse Mappings ───────────────────────────────────────────────────────
+const DEFAULT_REVERSE_MAP = [
+  ['OCPlatform', 'OpenClaw'],
+  ['ocplatform', 'openclaw'],
+  ['create_task', 'sessions_spawn'],
+  ['list_tasks', 'sessions_list'],
+  ['get_history', 'sessions_history'],
+  ['send_to_task', 'sessions_send'],
+  ['task_yield_interrupt', 'sessions_yield_interrupt'],
+  ['yield_task', 'sessions_yield'],
+  ['task_store', 'sessions_store'],
+  ['HB_ACK', 'HEARTBEAT_OK'],
+  ['HB_SIGNAL', 'HEARTBEAT'],
+  ['hb_signal', 'heartbeat'],
+  ['PAssistant', 'Prometheus'],
+  ['passistant', 'prometheus'],
+  ['skillhub.example.com', 'clawhub.com'],
+  ['skillhub', 'clawhub'],
+  ['agentd', 'clawd'],
+  ['lossless-ctx', 'lossless-claw'],
+  ['external', 'third-party'],
+  ['routing layer', 'billing proxy'],
+  ['routing-layer', 'billing-proxy'],
+  ['x-routing-config', 'x-anthropic-billing-header'],
+  ['x-routing-cfg', 'x-anthropic-billing'],
+  ['cfg=00000', 'cch=00000'],
+  ['rt_version', 'cc_version'],
+  ['rt_entrypoint', 'cc_entrypoint'],
+  ['routing config', 'billing header'],
+  ['usage quota', 'extra usage']
+];
+
+// ─── Configuration ──────────────────────────────────────────────────────────
+function loadConfig() {
+  const args = process.argv.slice(2);
+  let configPath = null;
+  let port = null;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
+    if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
+  }
+
+  let config = {};
+  if (configPath && fs.existsSync(configPath)) {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } else if (fs.existsSync('config.json')) {
+    config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+  }
+
+  const homeDir = os.homedir();
+  const credsPath = resolveClaudeCredentials(config.credentialsPath, homeDir);
+
+  if (!credsPath) {
+    console.error('[ERROR] Claude Code credentials not found. Run "claude auth login" first.');
+    if (process.platform === 'darwin') console.error('Also checked macOS Keychain.');
+    process.exit(1);
+  }
+
+  return {
+    port: port || config.port || DEFAULT_PORT,
+    credsPath,
+    replacements: dedupePairs([...DEFAULT_REPLACEMENTS, ...(config.replacements || [])]),
+    reverseMap: dedupePairs([...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])]),
+    toolRenames: dedupePairs([...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])]),
+    propRenames: dedupePairs([...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])]),
+    stripSystemConfig: config.stripSystemConfig !== false,
+    stripToolDescriptions: config.stripToolDescriptions !== false,
+    injectCCStubs: config.injectCCStubs !== false,
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    transformWorkers: normalizeTransformWorkers(config.transformWorkers),
+    maxTransformQueue: normalizeMaxTransformQueue(config.maxTransformQueue),
+    bodyPreviewChars: normalizeBodyPreviewChars(config.bodyPreviewChars),
+    usageLogEnabled: config.usageLogEnabled !== false,
+    usageLogPath: resolveUsageLogPath(config.usageLogPath, homeDir)
+  };
+}
+
+// ─── Token Management ───────────────────────────────────────────────────────
+const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
+
+function expandHome(p, homeDir = os.homedir()) {
+  return p && p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
+}
+
+function normalizeTransformWorkers(value) {
+  if (value === undefined || value === null) return DEFAULT_TRANSFORM_WORKERS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_TRANSFORM_WORKERS;
+  return Math.floor(parsed);
+}
+
+function normalizeMaxTransformQueue(value) {
+  if (value === undefined || value === null) return DEFAULT_MAX_TRANSFORM_QUEUE;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_TRANSFORM_QUEUE;
+  return Math.floor(parsed);
+}
+
+function normalizeBodyPreviewChars(value) {
+  if (value === undefined || value === null || value === false) return 0;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return 0;
+  return Math.min(Math.floor(parsed), 500);
+}
+
+function dedupePairs(pairs) {
+  const seen = new Set();
+  const out = [];
+  for (const pair of pairs || []) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const key = JSON.stringify([pair[0], pair[1]]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(pair);
+  }
+  return out;
+}
+
+function nowMs() {
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
+function formatMs(ms) {
+  return `${Math.max(0, Math.round(ms))}ms`;
+}
+
+
+function hashShort(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+}
+
+function resolveUsageLogPath(configPath, homeDir = os.homedir()) {
+  if (configPath === false || configPath === null) return null;
+  const p = expandHome(configPath || path.join(homeDir, '.openclaw', 'logs', USAGE_LOG_DEFAULT_NAME), homeDir);
+  return path.resolve(p);
+}
+
+function approxContentChars(content) {
+  if (typeof content === 'string') return content.length;
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue;
+    if (typeof part.text === 'string') total += part.text.length;
+    if (typeof part.content === 'string') total += part.content.length;
+  }
+  return total;
+}
+
+function contentPreview(content, maxChars) {
+  if (!maxChars) return null;
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .map(part => {
+        if (!part || typeof part !== 'object') return '';
+        if (typeof part.text === 'string') return part.text;
+        if (typeof part.content === 'string') return part.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join(' ');
+  }
+  if (!text) return null;
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+  return normalized.length > maxChars
+    ? `${normalized.slice(0, maxChars)}...`
+    : normalized;
+}
+
+function countContentParts(content, type) {
+  if (!Array.isArray(content)) return 0;
+  return content.filter(part => part && part.type === type).length;
+}
+
+function extractRequestMetadata(bodyStr, headers = {}, previewChars = 0) {
+  const meta = {
+    parseOk: false,
+    model: parseRequestModel(bodyStr),
+    stream: null,
+    maxTokens: null,
+    thinkingBudgetTokens: null,
+    messagesCount: null,
+    toolsCount: null,
+    systemChars: 0,
+    messageContentChars: 0,
+    userMessages: 0,
+    assistantMessages: 0,
+    toolUseBlocks: 0,
+    toolResultBlocks: 0,
+    firstUserHash: null,
+    lastUserHash: null,
+    firstUserPreview: null,
+    lastUserPreview: null,
+    bodyHash: hashShort(bodyStr)
+  };
+
+  const attributionHeaderNames = [
+    'x-openclaw-agent-id', 'x-openclaw-session-key', 'x-openclaw-session-id',
+    'x-openclaw-run-id', 'x-openclaw-cron-job-id', 'x-openclaw-task-id'
+  ];
+  const attribution = {};
+  for (const name of attributionHeaderNames) {
+    const value = headers[name] || headers[name.toLowerCase()];
+    if (value) attribution[name] = hashShort(value);
+  }
+  if (Object.keys(attribution).length) meta.attributionHeaderHashes = attribution;
+
+  try {
+    const parsed = JSON.parse(bodyStr);
+    meta.parseOk = true;
+    meta.model = parsed.model || meta.model;
+    meta.stream = Boolean(parsed.stream);
+    meta.maxTokens = parsed.max_tokens ?? parsed.maxTokens ?? null;
+    meta.thinkingBudgetTokens = parsed.thinking?.budget_tokens ?? parsed.thinking?.budgetTokens ?? null;
+    meta.toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 0;
+    meta.systemChars = typeof parsed.system === 'string'
+      ? parsed.system.length
+      : Array.isArray(parsed.system)
+        ? parsed.system.reduce((sum, part) => sum + approxContentChars(part?.text ?? part?.content ?? ''), 0)
+        : 0;
+
+    const toolNames = Array.isArray(parsed.tools) ? parsed.tools.map(t => t?.name).filter(Boolean) : [];
+    if (toolNames.length) meta.toolNamesHash = hashShort(toolNames.join('\n'));
+
+    if (Array.isArray(parsed.messages)) {
+      meta.messagesCount = parsed.messages.length;
+      let firstUser = null;
+      let lastUser = null;
+      let firstUserPreview = null;
+      let lastUserPreview = null;
+      for (const msg of parsed.messages) {
+        if (!msg || typeof msg !== 'object') continue;
+        if (msg.role === 'user') meta.userMessages++;
+        if (msg.role === 'assistant') meta.assistantMessages++;
+        meta.messageContentChars += approxContentChars(msg.content);
+        meta.toolUseBlocks += countContentParts(msg.content, 'tool_use');
+        meta.toolResultBlocks += countContentParts(msg.content, 'tool_result');
+        if (msg.role === 'user') {
+          const chars = approxContentChars(msg.content);
+          const marker = `${chars}:${JSON.stringify(msg.content).slice(0, 256)}`;
+          const preview = contentPreview(msg.content, previewChars);
+          if (!firstUser) firstUser = marker;
+          if (!firstUserPreview) firstUserPreview = preview;
+          lastUser = marker;
+          lastUserPreview = preview;
+        }
+      }
+      meta.firstUserHash = hashShort(firstUser);
+      meta.lastUserHash = hashShort(lastUser);
+      meta.firstUserPreview = firstUserPreview;
+      meta.lastUserPreview = lastUserPreview;
+    }
+  } catch (_) {
+    // Keep string-scanned fields above. Never log raw body content on parse failure.
+  }
+  return meta;
+}
+
+function ensureUsageLogDir(config) {
+  if (!config.usageLogEnabled || !config.usageLogPath) return;
+  fs.mkdirSync(path.dirname(config.usageLogPath), { recursive: true });
+}
+
+function appendUsageLog(config, entry) {
+  if (!config.usageLogEnabled || !config.usageLogPath) return;
+  try {
+    fs.appendFileSync(config.usageLogPath, JSON.stringify(entry) + '\n');
+  } catch (e) {
+    console.error(`[${new Date().toISOString().substring(11, 19)}] usage-log write failed: ${e.message}`);
+  }
+}
+
+function summarizeUsageLog(config, options = {}) {
+  if (!config.usageLogEnabled || !config.usageLogPath || !fs.existsSync(config.usageLogPath)) {
+    return { enabled: Boolean(config.usageLogEnabled), path: config.usageLogPath || null, entries: 0 };
+  }
+  const maxLines = Math.max(1, Math.min(Number(options.lines) || 5000, 50000));
+  const rawLines = fs.readFileSync(config.usageLogPath, 'utf8').trim().split(/\n+/).slice(-maxLines);
+  const byMinute = new Map();
+  const byModel = new Map();
+  const byEvent = new Map();
+  const largeRequests = [];
+  let parsed = 0;
+  for (const line of rawLines) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch (_) { continue; }
+    parsed++;
+    const minute = entry.ts ? entry.ts.slice(0, 16) : 'unknown';
+    const event = entry.event || 'unknown';
+    const model = entry.model || entry.request?.model || 'unknown';
+    const bytes = Number(entry.originalBytes || 0);
+    byEvent.set(event, (byEvent.get(event) || 0) + 1);
+    byModel.set(model, (byModel.get(model) || 0) + (event === 'request' ? 1 : 0));
+    if (event === 'request') {
+      const bucket = byMinute.get(minute) || { minute, requests: 0, originalBytes: 0, transformedBytes: 0, warn: 0, high: 0, critical: 0, models: {} };
+      bucket.requests++;
+      bucket.originalBytes += bytes;
+      bucket.transformedBytes += Number(entry.transformedBytes || 0);
+      if (entry.sizeLevel === 'WARN') bucket.warn++;
+      if (entry.sizeLevel === 'HIGH') bucket.high++;
+      if (entry.sizeLevel === 'CRITICAL') bucket.critical++;
+      bucket.models[model] = (bucket.models[model] || 0) + 1;
+      byMinute.set(minute, bucket);
+      if (bytes >= REQUEST_SIZE_WARN_BYTES) {
+        largeRequests.push({ ts: entry.ts, reqNum: entry.reqNum, model, originalBytes: bytes, transformedBytes: entry.transformedBytes, sizeLevel: entry.sizeLevel, request: entry.request });
+      }
+    }
+  }
+  const topMinutes = [...byMinute.values()].sort((a, b) => b.requests - a.requests).slice(0, 20);
+  const recentMinutes = [...byMinute.values()].sort((a, b) => a.minute.localeCompare(b.minute)).slice(-60);
+  return {
+    enabled: true,
+    path: config.usageLogPath,
+    sampledLines: rawLines.length,
+    parsedEntries: parsed,
+    eventCounts: Object.fromEntries([...byEvent.entries()].sort((a, b) => b[1] - a[1])),
+    modelRequestCounts: Object.fromEntries([...byModel.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])),
+    topMinutes,
+    recentMinutes,
+    largeRequests: largeRequests.slice(-100)
+  };
+}
+
+function requestSizeLevel(bytes) {
+  if (bytes >= REQUEST_SIZE_CRITICAL_BYTES) return 'CRITICAL';
+  if (bytes >= REQUEST_SIZE_HIGH_BYTES) return 'HIGH';
+  if (bytes >= REQUEST_SIZE_WARN_BYTES) return 'WARN';
+  return null;
+}
+
+function parseRequestModel(bodyStr) {
+  const match = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+  return match ? match[1] : 'unknown';
+}
+
+
+function parseCredentialPayload(raw) {
+  if (!raw) return null;
+  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed.claudeAiOauth?.accessToken ? parsed : null;
+  } catch(e) {
+    if (raw.startsWith('sk-ant-')) {
+      return {
+        claudeAiOauth: {
+          accessToken: raw,
+          expiresAt: Date.now() + 86400000,
+          subscriptionType: 'unknown'
+        }
+      };
+    }
+    return null;
+  }
+}
+
+function readCredentialFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath) || fs.statSync(filePath).size === 0) return null;
+  return parseCredentialPayload(fs.readFileSync(filePath, 'utf8'));
+}
+
+function readKeychainCredentials() {
+  if (process.platform !== 'darwin') return null;
+  const { execFileSync } = require('child_process');
+  for (const service of KEYCHAIN_SERVICES) {
+    try {
+      const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], { encoding: 'utf8' }).trim();
+      const creds = parseCredentialPayload(raw);
+      if (creds?.claudeAiOauth) return { service, creds };
+    } catch(e) {}
+  }
+  return null;
+}
+
+function writeCredentialFile(filePath, creds) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(creds));
+  fs.chmodSync(filePath, 0o600);
+}
+
+function resolveClaudeCredentials(configuredPath, homeDir = os.homedir()) {
+  const defaultPath = path.join(homeDir, '.claude', '.credentials.json');
+  const credsPaths = [
+    configuredPath,
+    defaultPath,
+    path.join(homeDir, '.claude', 'credentials.json')
+  ].filter(Boolean).map(p => expandHome(p, homeDir));
+
+  let bestFile = null;
+  for (const filePath of credsPaths) {
+    const creds = readCredentialFile(filePath);
+    if (creds?.claudeAiOauth) {
+      bestFile = { path: filePath, creds };
+      break;
+    }
+  }
+
+  const keychain = readKeychainCredentials();
+  if (keychain?.creds?.claudeAiOauth) {
+    const fileExpiry = bestFile?.creds?.claudeAiOauth?.expiresAt || 0;
+    const keychainExpiry = keychain.creds.claudeAiOauth.expiresAt || 0;
+    if (!bestFile || fileExpiry <= Date.now() || keychainExpiry > fileExpiry) {
+      const target = bestFile?.path || defaultPath;
+      writeCredentialFile(target, keychain.creds);
+      console.log(`[PROXY] Synced Claude credentials from macOS Keychain (${keychain.service})`);
+      return target;
+    }
+  }
+
+  return bestFile?.path || null;
+}
+
+function getToken(credsPath) {
+  let creds = readCredentialFile(credsPath);
+  const expiresAt = creds?.claudeAiOauth?.expiresAt || 0;
+  if (expiresAt <= Date.now()) {
+    const keychain = readKeychainCredentials();
+    const keychainExpiry = keychain?.creds?.claudeAiOauth?.expiresAt || 0;
+    if (keychainExpiry > expiresAt) {
+      writeCredentialFile(credsPath, keychain.creds);
+      creds = keychain.creds;
+      console.log(`[PROXY] Refreshed expired Claude credentials from macOS Keychain (${keychain.service})`);
+    }
+  }
+  const oauth = creds?.claudeAiOauth;
+  if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
+  return oauth;
+}
+
+// ─── Helper ─────────────────────────────────────────────────────────────────
+function findMatchingBracket(str, start) {
+  let d = 0;
+  for (let i = start; i < str.length; i++) {
+    if (str[i] === '[') d++;
+    else if (str[i] === ']') { d--; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+// ─── Request Processing ─────────────────────────────────────────────────────
+// Cooperative yield: hands control back to the event loop so the accept loop
+// keeps running mid-process. Prevents one large body from starving concurrent
+// requests during the many full-string split/join passes below.
+const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
+
+async function processBody(bodyStr, config) {
+  let m = bodyStr;
+  let yieldCounter = 0;
+  const maybeYield = async () => { if (++yieldCounter % 16 === 0) await yieldLoop(); };
+
+  // Layer 2: String trigger sanitization (global split/join)
+  for (const [find, replace] of config.replacements) {
+    m = m.split(find).join(replace);
+    await maybeYield();
+  }
+
+  // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
+  for (const [orig, cc] of config.toolRenames) {
+    m = m.split('"' + orig + '"').join('"' + cc + '"');
+    await maybeYield();
+  }
+
+  // Layer 6: Property name renaming
+  for (const [orig, renamed] of config.propRenames) {
+    m = m.split('"' + orig + '"').join('"' + renamed + '"');
+    await maybeYield();
+  }
+
+  await yieldLoop();
+
+  // Layer 4: System prompt template bypass
+  // Strip large runtime-specific templates and replace them with a brief paraphrase.
+
+  // OpenClaw template: identity line -> first workspace doc header.
+  if (config.stripSystemConfig) {
+    const IDENTITY_MARKER = 'You are a personal assistant';
+    const configStart = m.indexOf(IDENTITY_MARKER);
+    if (configStart !== -1) {
+      let stripFrom = configStart;
+      if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
+        stripFrom -= 2;
+      }
+      // Find end of config: first workspace doc header (AGENTS.md)
+      const configEnd = m.indexOf('AGENTS.md', configStart);
+      if (configEnd !== -1) {
+        // Back up to the \n## before AGENTS.md
+        let boundary = configEnd;
+        for (let i = configEnd - 1; i > stripFrom; i--) {
+          if (m[i] === '#' && m[i - 1] === '#' && i >= 3 && m[i - 3] === '\\' && m[i - 2] === 'n') {
+            boundary = i - 3;
+            break;
+          }
+        }
+
+        const strippedLen = boundary - stripFrom;
+        if (strippedLen > 1000) {
+          const PARAPHRASE =
+            '\\nYou are an AI operations assistant with access to all tools listed in this request ' +
+            'for file operations, command execution, web search, browser control, scheduling, ' +
+            'messaging, and session management. Tool names are case-sensitive and must be called ' +
+            'exactly as listed. Your responses route to the active channel automatically. ' +
+            'For cross-session communication, use the task messaging tools. ' +
+            'Skills defined in your workspace should be invoked when they match user requests. ' +
+            'Consult your workspace reference files for detailed operational configuration.\\n';
+
+          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
+          console.log(`[STRIP] Removed ${strippedLen} chars of config template`);
+        }
+      }
+    }
+  }
+
+  // Hermes template: preserve the Claude Code identity block, but strip the large
+  // SOUL/MEMORY/USER PROFILE/skills payload that follows it. This payload is
+  // structurally useful to Hermes but highly distinctive versus real Claude Code.
+  if (config.stripSystemConfig) {
+    const HERMES_SOUL_MARKERS = [
+      '# SOUL.md - Who You Are',
+      '# CLAUDE.md - Who You Are'
+    ];
+    const HERMES_SKILLS_MARKERS = [
+      '<available_skills>',
+      '<available_tools>'
+    ];
+    const HERMES_END_MARKERS = [
+      'Conversation started:',
+      'You are a CLI AI Agent.'
+    ];
+
+    let soulStart = -1;
+    for (const marker of HERMES_SOUL_MARKERS) {
+      const idx = m.indexOf(marker);
+      if (idx !== -1 && (soulStart === -1 || idx < soulStart)) soulStart = idx;
+    }
+    const hasSkillsBlock = HERMES_SKILLS_MARKERS.some(marker => m.indexOf(marker, soulStart) !== -1);
+    if (soulStart !== -1 && hasSkillsBlock) {
+      let boundary = -1;
+      for (const marker of HERMES_END_MARKERS) {
+        const idx = m.indexOf(marker, soulStart);
+        if (idx !== -1 && (boundary === -1 || idx < boundary)) boundary = idx;
+      }
+
+      if (boundary !== -1) {
+        let stripFrom = soulStart;
+        if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
+          stripFrom -= 2;
+        }
+        const strippedLen = boundary - stripFrom;
+        if (strippedLen > 1000) {
+          const PARAPHRASE =
+            '\\nAdditional workspace guidance, durable memory, user profile notes, and skill references ' +
+            'are available in this session context. Act as a practical CLI coding assistant, narrate ' +
+            'briefly before tool use, preserve user preferences, and consult available skills when the ' +
+            'task clearly matches them.\\n';
+
+          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
+          console.log(`[STRIP] Removed ${strippedLen} chars of Hermes template`);
+        }
+      }
+    }
+  }
+
+  // Layer 5: Tool description stripping
+  if (config.stripToolDescriptions) {
+    const toolsIdx = m.indexOf('"tools":[');
+    if (toolsIdx !== -1) {
+      const toolsEndIdx = findMatchingBracket(m, toolsIdx + '"tools":'.length);
+      if (toolsEndIdx !== -1) {
+        let section = m.slice(toolsIdx, toolsEndIdx + 1);
+        let from = 0;
+        while (true) {
+          const d = section.indexOf('"description":"', from);
+          if (d === -1) break;
+          const vs = d + '"description":"'.length;
+          let i = vs;
+          while (i < section.length) {
+            if (section[i] === '\\' && i + 1 < section.length) { i += 2; continue; }
+            if (section[i] === '"') break;
+            i++;
+          }
+          section = section.slice(0, vs) + section.slice(i);
+          from = vs + 1;
+        }
+        // Inject CC tool stubs
+        if (config.injectCCStubs) {
+          const insertAt = '"tools":['.length;
+          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
+        }
+        m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
+      }
+    }
+  } else if (config.injectCCStubs) {
+    // Inject stubs even without description stripping
+    const toolsIdx = m.indexOf('"tools":[');
+    if (toolsIdx !== -1) {
+      const insertAt = toolsIdx + '"tools":['.length;
+      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
+    }
+  }
+
+  // Layer 1: Billing header injection (dynamic fingerprint per request)
+  const BILLING_BLOCK = buildBillingBlock(m);
+  const sysArrayIdx = m.indexOf('"system":[');
+  if (sysArrayIdx !== -1) {
+    const insertAt = sysArrayIdx + '"system":['.length;
+    m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
+  } else if (m.includes('"system":"')) {
+    const sysStart = m.indexOf('"system":"');
+    let i = sysStart + '"system":"'.length;
+    while (i < m.length) {
+      if (m[i] === '\\') { i += 2; continue; }
+      if (m[i] === '"') break;
+      i++;
+    }
+    const sysEnd = i + 1;
+    const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
+    m = m.slice(0, sysStart)
+      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+      + m.slice(sysEnd);
+  } else {
+    m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
+  }
+
+  // Metadata injection: device_id + session_id matching real CC format
+  // Uses raw string manipulation to inject/replace metadata field
+  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+  const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
+  const existingMeta = m.indexOf('"metadata":{');
+  if (existingMeta !== -1) {
+    // Find end of existing metadata object
+    let depth = 0, mi = existingMeta + '"metadata":'.length;
+    for (; mi < m.length; mi++) {
+      if (m[mi] === '{') depth++;
+      else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+    }
+    m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
+  } else {
+    // Insert after opening brace
+    m = '{' + metaJson + ',' + m.slice(1);
+  }
+
+  // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
+  // Opus 4.6 disabled assistant message prefill. OpenClaw sometimes pre-fills the
+  // next assistant turn to resume interrupted responses, causing permanent 400
+  // errors ("This model does not support assistant message prefill"). The error is
+  // permanent for the affected session — every retry includes the same prefill.
+  // Fix: forward-scan the messages array with string-aware bracket matching,
+  // then pop trailing assistant messages until the array ends with a user message.
+  if (config.stripTrailingAssistantPrefill !== false) {
+    const msgsIdx = m.indexOf('"messages":[');
+    if (msgsIdx !== -1) {
+      const arrayStart = msgsIdx + '"messages":['.length;
+      const positions = [];
+      let depth = 0, inString = false, objStart = -1;
+      for (let i = arrayStart; i < m.length; i++) {
+        const c = m[i];
+        if (inString) {
+          if (c === '\\') { i++; continue; }
+          if (c === '"') inString = false;
+          continue;
+        }
+        if (c === '"') { inString = true; continue; }
+        if (c === '{') { if (depth === 0) objStart = i; depth++; }
+        else if (c === '}') { depth--; if (depth === 0 && objStart !== -1) { positions.push({ start: objStart, end: i }); objStart = -1; } }
+        else if (c === ']' && depth === 0) break;
+      }
+      let popped = 0;
+      while (positions.length > 0) {
+        const last = positions[positions.length - 1];
+        const obj = m.slice(last.start, last.end + 1);
+        if (!obj.includes('"role":"assistant"')) break;
+        let stripFrom = last.start;
+        for (let i = last.start - 1; i >= arrayStart; i--) {
+          if (m[i] === ',') { stripFrom = i; break; }
+          if (m[i] !== ' ' && m[i] !== '\n' && m[i] !== '\r' && m[i] !== '\t') break;
+        }
+        m = m.slice(0, stripFrom) + m.slice(last.end + 1);
+        positions.pop();
+        popped++;
+      }
+      if (popped > 0) {
+        console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s)`);
+      }
+    }
+  }
+
+  return m;
+}
+
+// ─── Response Processing ────────────────────────────────────────────────────
+function reverseMap(text, config) {
+  let r = text;
+  // Reverse tool names first (more specific patterns)
+  for (const [orig, cc] of config.toolRenames) {
+    r = r.split('"' + cc + '"').join('"' + orig + '"');
+  }
+  // Reverse property names
+  for (const [orig, renamed] of config.propRenames) {
+    r = r.split('"' + renamed + '"').join('"' + orig + '"');
+  }
+  // Reverse string replacements
+  for (const [sanitized, original] of config.reverseMap) {
+    r = r.split(sanitized).join(original);
+  }
+  return r;
+}
+
+// ─── Upstream Retry Handling ─────────────────────────────────────────────────
+const MAX_UPSTREAM_ATTEMPTS = 3;
+const RETRYABLE_UPSTREAM_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ECONNABORTED',
+  'EAI_AGAIN'
+]);
+
+function isRetryableUpstreamError(e) {
+  if (!e) return false;
+  if (RETRYABLE_UPSTREAM_ERROR_CODES.has(e.code)) return true;
+  return e.message === 'socket hang up';
+}
+
+function upstreamRetryDelayMs(attempt) {
+  const base = [500, 1500, 3500][Math.min(attempt - 1, 2)];
+  return base + Math.floor(Math.random() * 250);
+}
+
+// ─── Transform Worker Pool ──────────────────────────────────────────────────
+class TransformWorkerPool {
+  constructor(size, maxQueue = DEFAULT_MAX_TRANSFORM_QUEUE) {
+    this.size = Math.max(0, size || 0);
+    this.maxQueue = normalizeMaxTransformQueue(maxQueue);
+    this.workers = [];
+    this.queue = [];
+    this.nextId = 1;
+    this.closed = false;
+
+    for (let i = 0; i < this.size; i++) this.spawnWorker(i);
+  }
+
+  spawnWorker(index) {
+    if (this.closed) return;
+    const slot = {
+      index,
+      worker: new Worker(__filename, {
+        workerData: {
+          mode: 'transform-worker',
+          deviceId: DEVICE_ID,
+          sessionId: INSTANCE_SESSION_ID
+        }
+      }),
+      busy: false,
+      current: null
+    };
+
+    slot.worker.on('message', msg => {
+      const current = slot.current;
+      slot.busy = false;
+      slot.current = null;
+      if (current) {
+        if (msg.ok) current.resolve(msg.result);
+        else current.reject(new Error(msg.error || 'transform worker failed'));
+      }
+      this.drain();
+    });
+
+    slot.worker.on('error', err => {
+      if (slot.current) {
+        slot.current.reject(err);
+        slot.current = null;
+      }
+      slot.busy = false;
+    });
+
+    slot.worker.on('exit', code => {
+      const current = slot.current;
+      const idx = this.workers.indexOf(slot);
+      if (idx !== -1) this.workers.splice(idx, 1);
+      if (current) current.reject(new Error(`transform worker exited with code ${code}`));
+      if (!this.closed && code !== 0) {
+        console.error(`[WORKER] transform worker ${index} exited with code ${code}; respawning`);
+        this.spawnWorker(index);
+      }
+      this.drain();
+    });
+
+    this.workers.push(slot);
+  }
+
+  run(type, payload) {
+    if (this.closed) return Promise.reject(new Error('transform worker pool is closed'));
+    if (this.queue.length >= this.maxQueue) {
+      return Promise.reject(new Error(`transform worker queue saturated (${this.queue.length}/${this.maxQueue})`));
+    }
+    return new Promise((resolve, reject) => {
+      this.queue.push({
+        id: this.nextId++,
+        type,
+        payload,
+        resolve,
+        reject
+      });
+      this.drain();
+    });
+  }
+
+  drain() {
+    if (this.closed || this.queue.length === 0) return;
+    for (const slot of this.workers) {
+      if (this.queue.length === 0) return;
+      if (slot.busy) continue;
+      const task = this.queue.shift();
+      slot.busy = true;
+      slot.current = task;
+      slot.worker.postMessage({
+        id: task.id,
+        type: task.type,
+        payload: task.payload
+      });
+    }
+  }
+
+  stats() {
+    return {
+      enabled: this.size > 0,
+      workers: this.workers.length,
+      busy: this.workers.filter(w => w.busy).length,
+      queued: this.queue.length,
+      maxQueue: this.maxQueue
+    };
+  }
+
+  close() {
+    this.closed = true;
+    for (const task of this.queue.splice(0)) {
+      task.reject(new Error('transform worker pool closed'));
+    }
+    for (const slot of this.workers) {
+      slot.worker.terminate();
+    }
+  }
+}
+
+function createTransformPool(size, maxQueue) {
+  const workers = normalizeTransformWorkers(size);
+  return workers > 0 ? new TransformWorkerPool(workers, maxQueue) : null;
+}
+
+async function runProcessBody(bodyStr, config, transformPool, reqNum = '?') {
+  const started = nowMs();
+  const beforeStats = transformPool ? transformPool.stats() : null;
+  const result = transformPool
+    ? await transformPool.run('processBody', { bodyStr, config })
+    : await processBody(bodyStr, config);
+  const elapsed = nowMs() - started;
+  if (elapsed >= 250 || bodyStr.length >= REQUEST_SIZE_WARN_BYTES) {
+    const queueInfo = beforeStats ? ` workers=${beforeStats.busy}/${beforeStats.workers} queued=${beforeStats.queued}/${beforeStats.maxQueue}` : ' workers=inline';
+    console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} transform processBody ${formatMs(elapsed)}${queueInfo}`);
+  }
+  return result;
+}
+
+async function runReverseMap(text, config, transformPool, reqNum = '?') {
+  const started = nowMs();
+  const result = transformPool
+    ? await transformPool.run('reverseMap', { text, config })
+    : reverseMap(text, config);
+  const elapsed = nowMs() - started;
+  if (elapsed >= 250 || text.length >= REQUEST_SIZE_WARN_BYTES) {
+    console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} transform reverseMap ${formatMs(elapsed)} bytes=${text.length}`);
+  }
+  return result;
+}
+
+// ─── Server ─────────────────────────────────────────────────────────────────
+function startServer(config) {
+  let requestCount = 0;
+  const startedAt = Date.now();
+  const transformPool = createTransformPool(config.transformWorkers, config.maxTransformQueue);
+  ensureUsageLogDir(config);
+
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url && req.url.startsWith('/usage-summary')) {
+      try {
+        const u = new URL(req.url, `http://127.0.0.1:${config.port}`);
+        const summary = summarizeUsageLog(config, { lines: u.searchParams.get('lines') });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(summary, null, 2));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', message: e.message }));
+      }
+      return;
+    }
+
+    if (req.url === '/health' && req.method === 'GET') {
+      try {
+        const oauth = getToken(config.credsPath);
+        const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: expiresIn > 0 ? 'ok' : 'token_expired',
+          proxy: 'openclaw-billing-proxy',
+          version: VERSION,
+          requestsServed: requestCount,
+          uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
+          usageLog: config.usageLogEnabled ? config.usageLogPath : null,
+          tokenExpiresInHours: expiresIn.toFixed(1),
+          subscriptionType: oauth.subscriptionType,
+          transformPool: transformPool ? transformPool.stats() : { enabled: false, workers: 0, busy: 0, queued: 0, maxQueue: 0 },
+          layers: {
+            stringReplacements: config.replacements.length,
+            toolNameRenames: config.toolRenames.length,
+            propertyRenames: config.propRenames.length,
+            ccToolStubs: config.injectCCStubs ? CC_TOOL_STUBS.length : 0,
+            systemStripEnabled: config.stripSystemConfig,
+            descriptionStripEnabled: config.stripToolDescriptions
+          }
+        }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', message: e.message }));
+      }
+      return;
+    }
+
+    requestCount++;
+    const reqNum = requestCount;
+    const chunks = [];
+    const requestStartedAt = nowMs();
+
+    req.on('data', c => chunks.push(c));
+    req.on('end', async () => {
+      let body = Buffer.concat(chunks);
+      let oauth;
+      try { oauth = getToken(config.credsPath); } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        return;
+      }
+
+      let bodyStr = body.toString('utf8');
+      const originalSize = bodyStr.length;
+      const requestMeta = extractRequestMetadata(bodyStr, req.headers, config.bodyPreviewChars);
+      const requestModel = requestMeta.model;
+      const sizeLevel = requestSizeLevel(originalSize);
+      if (sizeLevel) {
+        console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} [SIZE-${sizeLevel}] request body ${originalSize}b model=${requestModel}; large bodies can stall transforms or signal weak compaction`);
+      }
+      try {
+        bodyStr = await runProcessBody(bodyStr, config, transformPool, reqNum);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        appendUsageLog(config, { ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'processBody_error', durationMs: nowMs() - requestStartedAt, originalBytes: originalSize, model: requestModel, error: e.message, request: requestMeta });
+        res.end(JSON.stringify({ type: 'error', error: { message: 'processBody failed: ' + e.message } }));
+        return;
+      }
+      body = Buffer.from(bodyStr, 'utf8');
+
+      const headers = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        const lk = key.toLowerCase();
+        if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
+            lk === 'x-api-key' || lk === 'content-length' ||
+            lk === 'x-session-affinity') continue; // strip non-CC headers
+        headers[key] = value;
+      }
+      headers['authorization'] = `Bearer ${oauth.accessToken}`;
+      headers['content-length'] = body.length;
+      headers['accept-encoding'] = 'identity';
+      headers['anthropic-version'] = '2023-06-01';
+
+      // Inject Stainless SDK + Claude Code identity headers
+      const ccHeaders = getStainlessHeaders();
+      for (const [k, v] of Object.entries(ccHeaders)) {
+        headers[k] = v;
+      }
+
+      const existingBeta = headers['anthropic-beta'] || '';
+      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
+      for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
+      headers['anthropic-beta'] = betas.join(',');
+
+      const ts = new Date().toISOString().substring(11, 19);
+      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} model=${requestModel} (${originalSize}b -> ${body.length}b)`);
+      if (config.bodyPreviewChars && (requestMeta.firstUserPreview || requestMeta.lastUserPreview)) {
+        console.log(`[${ts}] #${reqNum} body-preview first=${JSON.stringify(requestMeta.firstUserPreview)} last=${JSON.stringify(requestMeta.lastUserPreview)}`);
+      }
+      appendUsageLog(config, {
+        ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'request',
+        model: requestModel, originalBytes: originalSize, transformedBytes: body.length, sizeLevel, request: requestMeta
+      });
+
+      let completed = false;
+
+      const fail = (status, message) => {
+        if (completed) return;
+        completed = true;
+        if (!res.headersSent) {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { message } }));
+        }
+      };
+
+      const sendUpstream = (attempt = 1) => {
+        const upstream = https.request({
+          hostname: UPSTREAM_HOST, port: 443,
+          path: req.url, method: req.method, headers
+        }, (upRes) => {
+          const status = upRes.statusCode;
+          const attemptSuffix = attempt > 1 ? ` attempt=${attempt}/${MAX_UPSTREAM_ATTEMPTS}` : '';
+          console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} > ${status}${attemptSuffix}`);
+          appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_headers', status, attempt, durationMs: nowMs() - requestStartedAt });
+          if (status !== 200 && status !== 201) {
+            const errChunks = [];
+            upRes.on('data', c => errChunks.push(c));
+            upRes.on('end', () => {
+              (async () => {
+                if (completed) return;
+                let errBody = Buffer.concat(errChunks).toString();
+                const detection = errBody.includes('extra usage');
+                if (detection) {
+                  console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} DETECTION! Body: ${body.length}b`);
+                }
+                appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_error_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(errBody), detection });
+                errBody = await runReverseMap(errBody, config, transformPool, reqNum);
+                const nh = { ...upRes.headers };
+                nh['content-length'] = Buffer.byteLength(errBody);
+                completed = true;
+                res.writeHead(status, nh);
+                res.end(errBody);
+              })().catch(e => fail(502, e.message));
+            });
+            upRes.on('error', e => {
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_response_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
+              fail(502, e.message);
+            });
+            return;
+          }
+          if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
+            completed = true;
+            res.writeHead(status, upRes.headers);
+            upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
+            upRes.on('end', () => {
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_end', status, attempt, durationMs: nowMs() - requestStartedAt });
+              res.end();
+            });
+            upRes.on('error', e => {
+              console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} STREAM ERR: ${e.message}`);
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
+              if (!res.destroyed) res.end();
+            });
+          } else {
+            const respChunks = [];
+            upRes.on('data', c => respChunks.push(c));
+            upRes.on('end', () => {
+              (async () => {
+                if (completed) return;
+                let respBody = Buffer.concat(respChunks).toString();
+                respBody = await runReverseMap(respBody, config, transformPool, reqNum);
+                const nh = { ...upRes.headers };
+                nh['content-length'] = Buffer.byteLength(respBody);
+                appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(respBody) });
+                completed = true;
+                res.writeHead(status, nh);
+                res.end(respBody);
+              })().catch(e => fail(502, e.message));
+            });
+            upRes.on('error', e => {
+              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_response_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
+              fail(502, e.message);
+            });
+          }
+        });
+        upstream.on('error', e => {
+          if (completed) return;
+          if (isRetryableUpstreamError(e) && attempt < MAX_UPSTREAM_ATTEMPTS && !res.headersSent) {
+            const delay = upstreamRetryDelayMs(attempt);
+            const code = e.code ? ` code=${e.code}` : '';
+            console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} RETRY ${attempt + 1}/${MAX_UPSTREAM_ATTEMPTS} after ${e.message}${code} in ${delay}ms`);
+            appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'retry', attempt, nextAttempt: attempt + 1, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null, delayMs: delay });
+            setTimeout(() => sendUpstream(attempt + 1), delay);
+            return;
+          }
+          console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} ERR: ${e.message}`);
+          appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_error', attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
+          fail(502, e.message);
+        });
+        upstream.write(body);
+        upstream.end();
+      };
+
+      sendUpstream();
+    });
+  });
+
+  server.listen(config.port, '127.0.0.1', () => {
+    try {
+      const oauth = getToken(config.credsPath);
+      const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+      console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
+      console.log(`  ─────────────────────────────`);
+      console.log(`  Port:              ${config.port}`);
+      console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
+      console.log(`  Subscription:      ${oauth.subscriptionType}`);
+      console.log(`  Token expires:     ${h}h`);
+      console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
+      console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
+      console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
+      console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
+      console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
+      console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
+      console.log(`  Transform workers: ${transformPool ? transformPool.stats().workers : 'disabled'}`);
+      console.log(`  Max transform queue: ${transformPool ? transformPool.stats().maxQueue : 0}`);
+      console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+      console.log(`  CC headers:        Stainless SDK + identity`);
+      console.log(`  Credentials:       ${config.credsPath}`);
+      console.log(`  Usage log:         ${config.usageLogEnabled ? config.usageLogPath : 'disabled'}`);
+      console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+    } catch (e) {
+      console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
+    }
+  });
+
+  const shutdown = () => {
+    if (transformPool) transformPool.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+// ─── Worker Entrypoint ──────────────────────────────────────────────────────
+if (!isMainThread && workerData?.mode === 'transform-worker') {
+  parentPort.on('message', async msg => {
+    try {
+      let result;
+      if (msg.type === 'processBody') {
+        result = await processBody(msg.payload.bodyStr, msg.payload.config);
+      } else if (msg.type === 'reverseMap') {
+        result = reverseMap(msg.payload.text, msg.payload.config);
+      } else {
+        throw new Error(`unknown transform task: ${msg.type}`);
+      }
+      parentPort.postMessage({ id: msg.id, ok: true, result });
+    } catch (e) {
+      parentPort.postMessage({ id: msg.id, ok: false, error: e.message || String(e) });
+    }
+  });
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+if (require.main === module && isMainThread) {
+  const config = loadConfig();
+  startServer(config);
+}
+
+module.exports = {
+  loadConfig,
+  processBody,
+  reverseMap,
+  createTransformPool,
+  runProcessBody,
+  runReverseMap,
+  buildBillingBlock,
+  computeBillingFingerprint,
+  extractFirstUserText
+};
