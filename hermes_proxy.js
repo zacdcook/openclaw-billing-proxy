@@ -245,7 +245,7 @@ const DEFAULT_TOOL_RENAMES = [
   ['mcp__patch', 'Edit'],
   ['mcp__process', 'BashSessionCtl'],
   ['mcp__read_file', 'Read'],
-  ['mcp__search_files', 'Grep'],
+  ['mcp__search_files', 'SearchFiles'],
   ['mcp__session_search', 'TaskSearch'],
   ['mcp__skill_manage', 'SkillManage'],
   ['mcp__skill_view', 'SkillView'],
@@ -943,6 +943,34 @@ async function processBody(bodyStr, config) {
     if (toolsIdx !== -1) {
       const insertAt = toolsIdx + '"tools":['.length;
       m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
+    }
+  }
+
+  // Safety net: ensure tool names are unique (Anthropic 400s on duplicates).
+  // Stub injection + Hermes renames can collide; drop later duplicates by name.
+  if (config.injectCCStubs || (config.toolRenames && config.toolRenames.length)) {
+    const tIdx = m.indexOf('"tools":[');
+    if (tIdx !== -1) {
+      const tEnd = findMatchingBracket(m, tIdx + '"tools":'.length);
+      if (tEnd !== -1) {
+        try {
+          const arr = JSON.parse(m.slice(tIdx + '"tools":'.length, tEnd + 1));
+          if (Array.isArray(arr)) {
+            const seen = new Set();
+            const uniq = [];
+            for (const t of arr) {
+              const nm = t && t.name;
+              if (nm && seen.has(nm)) continue;
+              if (nm) seen.add(nm);
+              uniq.push(t);
+            }
+            if (uniq.length !== arr.length) {
+              console.log(`[DEDUP] removed ${arr.length - uniq.length} duplicate tool name(s)`);
+              m = m.slice(0, tIdx) + '"tools":' + JSON.stringify(uniq) + m.slice(tEnd + 1);
+            }
+          }
+        } catch (e) { /* if parse fails, leave tools untouched */ }
+      }
     }
   }
 
