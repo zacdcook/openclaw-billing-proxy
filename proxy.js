@@ -1021,10 +1021,16 @@ function canonicalizeWorkspacePaths(text) {
 function reverseJsonStringValue(text, config) {
   let r = text;
   for (const [orig, cc] of config.toolRenames) {
-    if (r === cc) return orig;
+    if (r === cc) {
+      r = orig;
+      break;
+    }
   }
   for (const [orig, renamed] of config.propRenames) {
-    if (r === renamed) return orig;
+    if (r === renamed) {
+      r = orig;
+      break;
+    }
   }
   for (const [sanitized, original] of config.reverseMap) {
     r = r.split(sanitized).join(original);

@@ -398,8 +398,8 @@ function loadConfig() {
     port: port || config.port || DEFAULT_PORT,
     credsPath,
     replacements: dedupePairs([...DEFAULT_REPLACEMENTS, ...(config.replacements || [])]),
-    reverseMap: dedupePairs([...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])]),
     toolRenames: dedupePairs([...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])]),
+    reverseMap: dedupePairs([...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])]),
     propRenames: dedupePairs([...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])]),
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
@@ -1081,6 +1081,26 @@ function reverseMap(text, config) {
   return r;
 }
 
+function reverseJsonStringValue(text, config) {
+  let r = text;
+  for (const [orig, cc] of config.toolRenames) {
+    if (r === cc) {
+      r = orig;
+      break;
+    }
+  }
+  for (const [orig, renamed] of config.propRenames) {
+    if (r === renamed) {
+      r = orig;
+      break;
+    }
+  }
+  for (const [sanitized, original] of config.reverseMap) {
+    r = r.split(sanitized).join(original);
+  }
+  return r;
+}
+
 // Strict SSE reverse mapping buffers a full streamed response and rewrites
 // logical Anthropic delta streams before forwarding them. This catches cases
 // where a sanitized token is split across separate text_delta or partial_json
@@ -1105,7 +1125,7 @@ function setPathValue(obj, pathParts, value) {
 }
 
 function reverseJsonStrings(value, config, skipPaths, currentPath = []) {
-  if (typeof value === 'string') return reverseMap(value, config);
+  if (typeof value === 'string') return reverseJsonStringValue(value, config);
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
       const childPath = currentPath.concat(i);
