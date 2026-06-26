@@ -164,14 +164,16 @@ function getStainlessHeaders() {
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
-  ['Hermes', 'Hank'],
-  ['hermes', 'Hank'],
+  // NOTE: removed bare ['Hermes','Hank'] / ['hermes','Hank'] renames — they
+  // rewrote real filesystem paths like ~/.hermes -> ~/.Hank, breaking commands.
+  // The Hermes branding is already removed by the Layer-4 template strip; the
+  // bare word 'Hermes' in user text is just a name, not a fingerprint.
   ['claude-code.nousresearch.com', 'docs.anthropic.com/claude-code'],
   ['nousresearch.com', 'anthropic.com'],
   ['nousresearch', 'anthropic'],
   ['cua-driver', 'computer-use-driver'],
   ['tirith', 'cli-runtime'],
-  ['Active Hank profile', 'Active session profile'],
+  ['Active Hermes profile', 'Active session profile'],
   ['OCPlatform', 'OCRoute'],
   ['ocplatform', 'ocroute'],
   ['OpenClaw', 'OCPlatform'],
