@@ -1210,6 +1210,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         body_str = body.decode("utf-8", errors="replace")
         original_size = len(body_str)
+
+        # --- Raw incoming request log (pre-transform, exactly as received) ---
+        # This prints the original OCPlatform request before any of the 8
+        # transform layers run. Comment out the two prints below to disable.
+        print(f"[INCOMING] #{req_num} {self.command} {self.path} ({original_size}b)", flush=True)
+        print(body_str, flush=True)
+
         request_meta = extract_request_metadata(body_str, dict(self.headers.items()), config["bodyPreviewChars"])
         request_model = request_meta["model"]
         size_level = request_size_level(original_size)
