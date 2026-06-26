@@ -29,18 +29,11 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.1.0';
-const DEFAULT_TRANSFORM_WORKERS = Math.max(2, Math.min(4, os.cpus()?.length || 2));
-const DEFAULT_MAX_TRANSFORM_QUEUE = 64;
-const REQUEST_SIZE_WARN_BYTES = 1 * 1024 * 1024;
-const REQUEST_SIZE_HIGH_BYTES = 2 * 1024 * 1024;
-const REQUEST_SIZE_CRITICAL_BYTES = 5 * 1024 * 1024;
-const USAGE_LOG_DEFAULT_NAME = 'billing-proxy-usage.jsonl';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -50,9 +43,8 @@ const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 
 // Persistent per-instance identifiers (generated once at startup)
-const WORKER_IDENTITY = workerData?.mode === 'transform-worker' ? workerData : {};
-const DEVICE_ID = WORKER_IDENTITY.deviceId || crypto.randomBytes(32).toString('hex');
-const INSTANCE_SESSION_ID = WORKER_IDENTITY.sessionId || crypto.randomUUID();
+const DEVICE_ID = crypto.randomBytes(32).toString('hex');
+const INSTANCE_SESSION_ID = crypto.randomUUID();
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
@@ -164,8 +156,6 @@ function getStainlessHeaders() {
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
-  ['OCPlatform', 'OCRoute'],
-  ['ocplatform', 'ocroute'],
   ['OpenClaw', 'OCPlatform'],
   ['openclaw', 'ocplatform'],
   ['Hermes Agent', 'Claude Code'],
@@ -269,7 +259,7 @@ const DEFAULT_TOOL_RENAMES = [
   ['mcp_memory', 'MemoryStore'],
   ['mcp_patch', 'PatchApply'],
   ['mcp_process', 'BashSessionCtl'],
-  ['mcp_read_file', 'FileRead'],
+  ['mcp_read_file', 'Read'],
   ['mcp_search_files', 'GrepFiles'],
   ['mcp_session_search', 'TaskSearch'],
   ['mcp_skill_manage', 'SkillManage'],
@@ -279,7 +269,7 @@ const DEFAULT_TOOL_RENAMES = [
   ['mcp_text_to_speech', 'Speech'],
   ['mcp_todo', 'TodoWrite'],
   ['mcp_vision_analyze', 'VisionAnalyze'],
-  ['mcp_write_file', 'FileWrite']
+  ['mcp_write_file', 'Write']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -299,8 +289,6 @@ const DEFAULT_PROP_RENAMES = [
 const DEFAULT_REVERSE_MAP = [
   ['OCPlatform', 'OpenClaw'],
   ['ocplatform', 'openclaw'],
-  ['OCRoute', 'OCPlatform'],
-  ['ocroute', 'ocplatform'],
   ['create_task', 'sessions_spawn'],
   ['list_tasks', 'sessions_list'],
   ['get_history', 'sessions_history'],
@@ -333,7 +321,7 @@ const DEFAULT_REVERSE_MAP = [
 function loadConfig() {
   const args = process.argv.slice(2);
   let configPath = null;
-  let port = null;
+  let port = DEFAULT_PORT;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
@@ -357,21 +345,16 @@ function loadConfig() {
   }
 
   return {
-    port: port || config.port || DEFAULT_PORT,
+    port: config.port || port,
     credsPath,
-    replacements: dedupePairs([...DEFAULT_REPLACEMENTS, ...(config.replacements || [])]),
-    reverseMap: dedupePairs([...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])]),
-    toolRenames: dedupePairs([...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])]),
-    propRenames: dedupePairs([...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])]),
+    replacements: [...DEFAULT_REPLACEMENTS, ...(config.replacements || [])],
+    reverseMap: [...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])],
+    toolRenames: [...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])],
+    propRenames: [...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])],
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
-    transformWorkers: normalizeTransformWorkers(config.transformWorkers),
-    maxTransformQueue: normalizeMaxTransformQueue(config.maxTransformQueue),
-    bodyPreviewChars: normalizeBodyPreviewChars(config.bodyPreviewChars),
-    usageLogEnabled: config.usageLogEnabled !== false,
-    usageLogPath: resolveUsageLogPath(config.usageLogPath, homeDir)
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
 
@@ -381,264 +364,6 @@ const KEYCHAIN_SERVICES = ['Claude Code-credentials', 'claude-code', 'claude', '
 function expandHome(p, homeDir = os.homedir()) {
   return p && p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
 }
-
-function normalizeTransformWorkers(value) {
-  if (value === undefined || value === null) return DEFAULT_TRANSFORM_WORKERS;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_TRANSFORM_WORKERS;
-  return Math.floor(parsed);
-}
-
-function normalizeMaxTransformQueue(value) {
-  if (value === undefined || value === null) return DEFAULT_MAX_TRANSFORM_QUEUE;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_TRANSFORM_QUEUE;
-  return Math.floor(parsed);
-}
-
-function normalizeBodyPreviewChars(value) {
-  if (value === undefined || value === null || value === false) return 0;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 1) return 0;
-  return Math.min(Math.floor(parsed), 500);
-}
-
-function dedupePairs(pairs) {
-  const seen = new Set();
-  const out = [];
-  for (const pair of pairs || []) {
-    if (!Array.isArray(pair) || pair.length < 2) continue;
-    const key = JSON.stringify([pair[0], pair[1]]);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(pair);
-  }
-  return out;
-}
-
-function nowMs() {
-  return Number(process.hrtime.bigint() / 1000000n);
-}
-
-function formatMs(ms) {
-  return `${Math.max(0, Math.round(ms))}ms`;
-}
-
-
-function hashShort(value) {
-  if (value === undefined || value === null || value === '') return null;
-  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
-}
-
-function resolveUsageLogPath(configPath, homeDir = os.homedir()) {
-  if (configPath === false || configPath === null) return null;
-  const p = expandHome(configPath || path.join(homeDir, '.openclaw', 'logs', USAGE_LOG_DEFAULT_NAME), homeDir);
-  return path.resolve(p);
-}
-
-function approxContentChars(content) {
-  if (typeof content === 'string') return content.length;
-  if (!Array.isArray(content)) return 0;
-  let total = 0;
-  for (const part of content) {
-    if (!part || typeof part !== 'object') continue;
-    if (typeof part.text === 'string') total += part.text.length;
-    if (typeof part.content === 'string') total += part.content.length;
-  }
-  return total;
-}
-
-function contentPreview(content, maxChars) {
-  if (!maxChars) return null;
-  let text = '';
-  if (typeof content === 'string') {
-    text = content;
-  } else if (Array.isArray(content)) {
-    text = content
-      .map(part => {
-        if (!part || typeof part !== 'object') return '';
-        if (typeof part.text === 'string') return part.text;
-        if (typeof part.content === 'string') return part.content;
-        return '';
-      })
-      .filter(Boolean)
-      .join(' ');
-  }
-  if (!text) return null;
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  if (!normalized) return null;
-  return normalized.length > maxChars
-    ? `${normalized.slice(0, maxChars)}...`
-    : normalized;
-}
-
-function countContentParts(content, type) {
-  if (!Array.isArray(content)) return 0;
-  return content.filter(part => part && part.type === type).length;
-}
-
-function extractRequestMetadata(bodyStr, headers = {}, previewChars = 0) {
-  const meta = {
-    parseOk: false,
-    model: parseRequestModel(bodyStr),
-    stream: null,
-    maxTokens: null,
-    thinkingBudgetTokens: null,
-    messagesCount: null,
-    toolsCount: null,
-    systemChars: 0,
-    messageContentChars: 0,
-    userMessages: 0,
-    assistantMessages: 0,
-    toolUseBlocks: 0,
-    toolResultBlocks: 0,
-    firstUserHash: null,
-    lastUserHash: null,
-    firstUserPreview: null,
-    lastUserPreview: null,
-    bodyHash: hashShort(bodyStr)
-  };
-
-  const attributionHeaderNames = [
-    'x-openclaw-agent-id', 'x-openclaw-session-key', 'x-openclaw-session-id',
-    'x-openclaw-run-id', 'x-openclaw-cron-job-id', 'x-openclaw-task-id'
-  ];
-  const attribution = {};
-  for (const name of attributionHeaderNames) {
-    const value = headers[name] || headers[name.toLowerCase()];
-    if (value) attribution[name] = hashShort(value);
-  }
-  if (Object.keys(attribution).length) meta.attributionHeaderHashes = attribution;
-
-  try {
-    const parsed = JSON.parse(bodyStr);
-    meta.parseOk = true;
-    meta.model = parsed.model || meta.model;
-    meta.stream = Boolean(parsed.stream);
-    meta.maxTokens = parsed.max_tokens ?? parsed.maxTokens ?? null;
-    meta.thinkingBudgetTokens = parsed.thinking?.budget_tokens ?? parsed.thinking?.budgetTokens ?? null;
-    meta.toolsCount = Array.isArray(parsed.tools) ? parsed.tools.length : 0;
-    meta.systemChars = typeof parsed.system === 'string'
-      ? parsed.system.length
-      : Array.isArray(parsed.system)
-        ? parsed.system.reduce((sum, part) => sum + approxContentChars(part?.text ?? part?.content ?? ''), 0)
-        : 0;
-
-    const toolNames = Array.isArray(parsed.tools) ? parsed.tools.map(t => t?.name).filter(Boolean) : [];
-    if (toolNames.length) meta.toolNamesHash = hashShort(toolNames.join('\n'));
-
-    if (Array.isArray(parsed.messages)) {
-      meta.messagesCount = parsed.messages.length;
-      let firstUser = null;
-      let lastUser = null;
-      let firstUserPreview = null;
-      let lastUserPreview = null;
-      for (const msg of parsed.messages) {
-        if (!msg || typeof msg !== 'object') continue;
-        if (msg.role === 'user') meta.userMessages++;
-        if (msg.role === 'assistant') meta.assistantMessages++;
-        meta.messageContentChars += approxContentChars(msg.content);
-        meta.toolUseBlocks += countContentParts(msg.content, 'tool_use');
-        meta.toolResultBlocks += countContentParts(msg.content, 'tool_result');
-        if (msg.role === 'user') {
-          const chars = approxContentChars(msg.content);
-          const marker = `${chars}:${JSON.stringify(msg.content).slice(0, 256)}`;
-          const preview = contentPreview(msg.content, previewChars);
-          if (!firstUser) firstUser = marker;
-          if (!firstUserPreview) firstUserPreview = preview;
-          lastUser = marker;
-          lastUserPreview = preview;
-        }
-      }
-      meta.firstUserHash = hashShort(firstUser);
-      meta.lastUserHash = hashShort(lastUser);
-      meta.firstUserPreview = firstUserPreview;
-      meta.lastUserPreview = lastUserPreview;
-    }
-  } catch (_) {
-    // Keep string-scanned fields above. Never log raw body content on parse failure.
-  }
-  return meta;
-}
-
-function ensureUsageLogDir(config) {
-  if (!config.usageLogEnabled || !config.usageLogPath) return;
-  fs.mkdirSync(path.dirname(config.usageLogPath), { recursive: true });
-}
-
-function appendUsageLog(config, entry) {
-  if (!config.usageLogEnabled || !config.usageLogPath) return;
-  try {
-    fs.appendFileSync(config.usageLogPath, JSON.stringify(entry) + '\n');
-  } catch (e) {
-    console.error(`[${new Date().toISOString().substring(11, 19)}] usage-log write failed: ${e.message}`);
-  }
-}
-
-function summarizeUsageLog(config, options = {}) {
-  if (!config.usageLogEnabled || !config.usageLogPath || !fs.existsSync(config.usageLogPath)) {
-    return { enabled: Boolean(config.usageLogEnabled), path: config.usageLogPath || null, entries: 0 };
-  }
-  const maxLines = Math.max(1, Math.min(Number(options.lines) || 5000, 50000));
-  const rawLines = fs.readFileSync(config.usageLogPath, 'utf8').trim().split(/\n+/).slice(-maxLines);
-  const byMinute = new Map();
-  const byModel = new Map();
-  const byEvent = new Map();
-  const largeRequests = [];
-  let parsed = 0;
-  for (const line of rawLines) {
-    if (!line) continue;
-    let entry;
-    try { entry = JSON.parse(line); } catch (_) { continue; }
-    parsed++;
-    const minute = entry.ts ? entry.ts.slice(0, 16) : 'unknown';
-    const event = entry.event || 'unknown';
-    const model = entry.model || entry.request?.model || 'unknown';
-    const bytes = Number(entry.originalBytes || 0);
-    byEvent.set(event, (byEvent.get(event) || 0) + 1);
-    byModel.set(model, (byModel.get(model) || 0) + (event === 'request' ? 1 : 0));
-    if (event === 'request') {
-      const bucket = byMinute.get(minute) || { minute, requests: 0, originalBytes: 0, transformedBytes: 0, warn: 0, high: 0, critical: 0, models: {} };
-      bucket.requests++;
-      bucket.originalBytes += bytes;
-      bucket.transformedBytes += Number(entry.transformedBytes || 0);
-      if (entry.sizeLevel === 'WARN') bucket.warn++;
-      if (entry.sizeLevel === 'HIGH') bucket.high++;
-      if (entry.sizeLevel === 'CRITICAL') bucket.critical++;
-      bucket.models[model] = (bucket.models[model] || 0) + 1;
-      byMinute.set(minute, bucket);
-      if (bytes >= REQUEST_SIZE_WARN_BYTES) {
-        largeRequests.push({ ts: entry.ts, reqNum: entry.reqNum, model, originalBytes: bytes, transformedBytes: entry.transformedBytes, sizeLevel: entry.sizeLevel, request: entry.request });
-      }
-    }
-  }
-  const topMinutes = [...byMinute.values()].sort((a, b) => b.requests - a.requests).slice(0, 20);
-  const recentMinutes = [...byMinute.values()].sort((a, b) => a.minute.localeCompare(b.minute)).slice(-60);
-  return {
-    enabled: true,
-    path: config.usageLogPath,
-    sampledLines: rawLines.length,
-    parsedEntries: parsed,
-    eventCounts: Object.fromEntries([...byEvent.entries()].sort((a, b) => b[1] - a[1])),
-    modelRequestCounts: Object.fromEntries([...byModel.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])),
-    topMinutes,
-    recentMinutes,
-    largeRequests: largeRequests.slice(-100)
-  };
-}
-
-function requestSizeLevel(bytes) {
-  if (bytes >= REQUEST_SIZE_CRITICAL_BYTES) return 'CRITICAL';
-  if (bytes >= REQUEST_SIZE_HIGH_BYTES) return 'HIGH';
-  if (bytes >= REQUEST_SIZE_WARN_BYTES) return 'WARN';
-  return null;
-}
-
-function parseRequestModel(bodyStr) {
-  const match = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
-  return match ? match[1] : 'unknown';
-}
-
 
 function parseCredentialPayload(raw) {
   if (!raw) return null;
@@ -744,35 +469,23 @@ function findMatchingBracket(str, start) {
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-// Cooperative yield: hands control back to the event loop so the accept loop
-// keeps running mid-process. Prevents one large body from starving concurrent
-// requests during the many full-string split/join passes below.
-const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
-
-async function processBody(bodyStr, config) {
+function processBody(bodyStr, config) {
   let m = bodyStr;
-  let yieldCounter = 0;
-  const maybeYield = async () => { if (++yieldCounter % 16 === 0) await yieldLoop(); };
 
   // Layer 2: String trigger sanitization (global split/join)
   for (const [find, replace] of config.replacements) {
     m = m.split(find).join(replace);
-    await maybeYield();
   }
 
   // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
   for (const [orig, cc] of config.toolRenames) {
     m = m.split('"' + orig + '"').join('"' + cc + '"');
-    await maybeYield();
   }
 
   // Layer 6: Property name renaming
   for (const [orig, renamed] of config.propRenames) {
     m = m.split('"' + orig + '"').join('"' + renamed + '"');
-    await maybeYield();
   }
-
-  await yieldLoop();
 
   // Layer 4: System prompt template bypass
   // Strip large runtime-specific templates and replace them with a brief paraphrase.
@@ -1008,196 +721,7 @@ function reverseMap(text, config) {
   for (const [sanitized, original] of config.reverseMap) {
     r = r.split(sanitized).join(original);
   }
-  return canonicalizeWorkspacePaths(r);
-}
-
-function canonicalizeWorkspacePaths(text) {
-  const homeDir = os.homedir();
-  return text
-    .split(`${homeDir}/.ocplatform/workspace`).join(`${homeDir}/.openclaw/workspace`)
-    .split('~/.ocplatform/workspace').join('~/.openclaw/workspace');
-}
-
-function reverseJsonStringValue(text, config) {
-  let r = text;
-  for (const [orig, cc] of config.toolRenames) {
-    if (r === cc) return orig;
-  }
-  for (const [orig, renamed] of config.propRenames) {
-    if (r === renamed) return orig;
-  }
-  for (const [sanitized, original] of config.reverseMap) {
-    r = r.split(sanitized).join(original);
-  }
-  return canonicalizeWorkspacePaths(r);
-}
-
-// Strict SSE reverse mapping buffers a full streamed response and rewrites
-// logical Anthropic delta streams before forwarding them. This catches cases
-// where a sanitized token is split across separate text_delta or partial_json
-// events, e.g. ".oc" + "platform/...".
-function pathKey(pathParts) {
-  return pathParts.map(String).join('\x1f');
-}
-
-function getPathValue(obj, pathParts) {
-  let current = obj;
-  for (const part of pathParts) {
-    if (!current || typeof current !== 'object') return undefined;
-    current = current[part];
-  }
-  return current;
-}
-
-function setPathValue(obj, pathParts, value) {
-  let current = obj;
-  for (let i = 0; i < pathParts.length - 1; i++) current = current[pathParts[i]];
-  current[pathParts[pathParts.length - 1]] = value;
-}
-
-function reverseJsonStrings(value, config, skipPaths, currentPath = []) {
-  if (typeof value === 'string') return reverseJsonStringValue(value, config);
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      const childPath = currentPath.concat(i);
-      if (!skipPaths.has(pathKey(childPath))) {
-        value[i] = reverseJsonStrings(value[i], config, skipPaths, childPath);
-      }
-    }
-    return value;
-  }
-  if (value && typeof value === 'object') {
-    for (const key of Object.keys(value)) {
-      const childPath = currentPath.concat(key);
-      if (!skipPaths.has(pathKey(childPath))) {
-        value[key] = reverseJsonStrings(value[key], config, skipPaths, childPath);
-      }
-    }
-  }
-  return value;
-}
-
-function addSseFragmentCapture(groups, skipPaths, obj, groupKey, pathParts) {
-  const value = getPathValue(obj, pathParts);
-  if (typeof value !== 'string') return;
-  if (!groups.has(groupKey)) groups.set(groupKey, []);
-  groups.get(groupKey).push({ obj, pathParts, value });
-  skipPaths.add(pathKey(pathParts));
-}
-
-function captureSseDeltaFragments(obj, groups, skipPaths) {
-  if (!obj || typeof obj !== 'object') return;
-
-  if (obj.type === 'content_block_delta' && obj.delta && typeof obj.delta === 'object') {
-    const index = obj.index ?? 0;
-    if (obj.delta.type === 'text_delta') {
-      addSseFragmentCapture(groups, skipPaths, obj, `text:${index}`, ['delta', 'text']);
-    } else if (obj.delta.type === 'input_json_delta') {
-      addSseFragmentCapture(groups, skipPaths, obj, `input_json:${index}`, ['delta', 'partial_json']);
-    }
-  }
-
-  // Legacy/compat streaming shape.
-  if (typeof obj.completion === 'string') {
-    addSseFragmentCapture(groups, skipPaths, obj, 'completion', ['completion']);
-  }
-}
-
-function redistributeSseFragments(groups, config) {
-  for (const refs of groups.values()) {
-    if (!refs.length) continue;
-    const transformed = reverseMap(refs.map(ref => ref.value).join(''), config);
-    for (let i = 0; i < refs.length; i++) {
-      const ref = refs[i];
-      setPathValue(ref.obj, ref.pathParts, i === 0 ? transformed : '');
-    }
-  }
-}
-
-function parseSseFrames(text) {
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const blocks = normalized.split('\n\n');
-  const frames = [];
-
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    if (!block && i === blocks.length - 1) continue;
-    if (!block) {
-      frames.push({ raw: '\n\n' });
-      continue;
-    }
-
-    const complete = i < blocks.length - 1 || normalized.endsWith('\n\n');
-    const lines = block.split('\n');
-    const dataIndexes = [];
-    const dataParts = [];
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-      const line = lines[lineIndex];
-      if (!line.startsWith('data:')) continue;
-      dataIndexes.push(lineIndex);
-      let data = line.slice('data:'.length);
-      if (data.startsWith(' ')) data = data.slice(1);
-      dataParts.push(data);
-    }
-
-    frames.push({
-      raw: block + (complete ? '\n\n' : ''),
-      lines,
-      dataIndexes,
-      data: dataParts.join('\n'),
-      dataObj: null
-    });
-  }
-
-  return frames;
-}
-
-function renderSseFrame(frame) {
-  if (!frame.lines || !frame.dataIndexes.length || !frame.dataObj) return frame.raw;
-
-  const dataLines = JSON.stringify(frame.dataObj).split('\n').map(line => `data: ${line}`);
-  const out = [];
-  let insertedData = false;
-  const dataIndexSet = new Set(frame.dataIndexes);
-
-  for (let i = 0; i < frame.lines.length; i++) {
-    if (!dataIndexSet.has(i)) {
-      out.push(frame.lines[i]);
-      continue;
-    }
-    if (!insertedData) {
-      out.push(...dataLines);
-      insertedData = true;
-    }
-  }
-
-  return out.join('\n') + '\n\n';
-}
-
-function transformSseResponse(text, config) {
-  const frames = parseSseFrames(text);
-  const groups = new Map();
-
-  for (const frame of frames) {
-    if (!frame.dataIndexes || !frame.dataIndexes.length) continue;
-    const trimmed = frame.data.trim();
-    if (!trimmed || trimmed === '[DONE]') continue;
-
-    try {
-      frame.dataObj = JSON.parse(frame.data);
-    } catch (_) {
-      frame.raw = reverseMap(frame.raw, config);
-      continue;
-    }
-
-    const skipPaths = new Set();
-    captureSseDeltaFragments(frame.dataObj, groups, skipPaths);
-    reverseJsonStrings(frame.dataObj, config, skipPaths);
-  }
-
-  redistributeSseFragments(groups, config);
-
-  return frames.map(renderSseFrame).join('');
+  return r;
 }
 
 // ─── Upstream Retry Handling ─────────────────────────────────────────────────
@@ -1221,174 +745,12 @@ function upstreamRetryDelayMs(attempt) {
   return base + Math.floor(Math.random() * 250);
 }
 
-// ─── Transform Worker Pool ──────────────────────────────────────────────────
-class TransformWorkerPool {
-  constructor(size, maxQueue = DEFAULT_MAX_TRANSFORM_QUEUE) {
-    this.size = Math.max(0, size || 0);
-    this.maxQueue = normalizeMaxTransformQueue(maxQueue);
-    this.workers = [];
-    this.queue = [];
-    this.nextId = 1;
-    this.closed = false;
-
-    for (let i = 0; i < this.size; i++) this.spawnWorker(i);
-  }
-
-  spawnWorker(index) {
-    if (this.closed) return;
-    const slot = {
-      index,
-      worker: new Worker(__filename, {
-        workerData: {
-          mode: 'transform-worker',
-          deviceId: DEVICE_ID,
-          sessionId: INSTANCE_SESSION_ID
-        }
-      }),
-      busy: false,
-      current: null
-    };
-
-    slot.worker.on('message', msg => {
-      const current = slot.current;
-      slot.busy = false;
-      slot.current = null;
-      if (current) {
-        if (msg.ok) current.resolve(msg.result);
-        else current.reject(new Error(msg.error || 'transform worker failed'));
-      }
-      this.drain();
-    });
-
-    slot.worker.on('error', err => {
-      if (slot.current) {
-        slot.current.reject(err);
-        slot.current = null;
-      }
-      slot.busy = false;
-    });
-
-    slot.worker.on('exit', code => {
-      const current = slot.current;
-      const idx = this.workers.indexOf(slot);
-      if (idx !== -1) this.workers.splice(idx, 1);
-      if (current) current.reject(new Error(`transform worker exited with code ${code}`));
-      if (!this.closed && code !== 0) {
-        console.error(`[WORKER] transform worker ${index} exited with code ${code}; respawning`);
-        this.spawnWorker(index);
-      }
-      this.drain();
-    });
-
-    this.workers.push(slot);
-  }
-
-  run(type, payload) {
-    if (this.closed) return Promise.reject(new Error('transform worker pool is closed'));
-    if (this.queue.length >= this.maxQueue) {
-      return Promise.reject(new Error(`transform worker queue saturated (${this.queue.length}/${this.maxQueue})`));
-    }
-    return new Promise((resolve, reject) => {
-      this.queue.push({
-        id: this.nextId++,
-        type,
-        payload,
-        resolve,
-        reject
-      });
-      this.drain();
-    });
-  }
-
-  drain() {
-    if (this.closed || this.queue.length === 0) return;
-    for (const slot of this.workers) {
-      if (this.queue.length === 0) return;
-      if (slot.busy) continue;
-      const task = this.queue.shift();
-      slot.busy = true;
-      slot.current = task;
-      slot.worker.postMessage({
-        id: task.id,
-        type: task.type,
-        payload: task.payload
-      });
-    }
-  }
-
-  stats() {
-    return {
-      enabled: this.size > 0,
-      workers: this.workers.length,
-      busy: this.workers.filter(w => w.busy).length,
-      queued: this.queue.length,
-      maxQueue: this.maxQueue
-    };
-  }
-
-  close() {
-    this.closed = true;
-    for (const task of this.queue.splice(0)) {
-      task.reject(new Error('transform worker pool closed'));
-    }
-    for (const slot of this.workers) {
-      slot.worker.terminate();
-    }
-  }
-}
-
-function createTransformPool(size, maxQueue) {
-  const workers = normalizeTransformWorkers(size);
-  return workers > 0 ? new TransformWorkerPool(workers, maxQueue) : null;
-}
-
-async function runProcessBody(bodyStr, config, transformPool, reqNum = '?') {
-  const started = nowMs();
-  const beforeStats = transformPool ? transformPool.stats() : null;
-  const result = transformPool
-    ? await transformPool.run('processBody', { bodyStr, config })
-    : await processBody(bodyStr, config);
-  const elapsed = nowMs() - started;
-  if (elapsed >= 250 || bodyStr.length >= REQUEST_SIZE_WARN_BYTES) {
-    const queueInfo = beforeStats ? ` workers=${beforeStats.busy}/${beforeStats.workers} queued=${beforeStats.queued}/${beforeStats.maxQueue}` : ' workers=inline';
-    console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} transform processBody ${formatMs(elapsed)}${queueInfo}`);
-  }
-  return result;
-}
-
-async function runReverseMap(text, config, transformPool, reqNum = '?') {
-  const started = nowMs();
-  const result = transformPool
-    ? await transformPool.run('reverseMap', { text, config })
-    : reverseMap(text, config);
-  const elapsed = nowMs() - started;
-  if (elapsed >= 250 || text.length >= REQUEST_SIZE_WARN_BYTES) {
-    console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} transform reverseMap ${formatMs(elapsed)} bytes=${text.length}`);
-  }
-  return result;
-}
-
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
   const startedAt = Date.now();
-  const transformPool = createTransformPool(config.transformWorkers, config.maxTransformQueue);
-  ensureUsageLogDir(config);
 
   const server = http.createServer((req, res) => {
-    if (req.method === 'GET' && req.url && req.url.startsWith('/usage-summary')) {
-      try {
-        const u = new URL(req.url, `http://127.0.0.1:${config.port}`);
-        const summary = summarizeUsageLog(config, { lines: u.searchParams.get('lines') });
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(summary, null, 2));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', message: e.message }));
-      }
-      return;
-    }
-
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
@@ -1400,10 +762,8 @@ function startServer(config) {
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
-          usageLog: config.usageLogEnabled ? config.usageLogPath : null,
           tokenExpiresInHours: expiresIn.toFixed(1),
           subscriptionType: oauth.subscriptionType,
-          transformPool: transformPool ? transformPool.stats() : { enabled: false, workers: 0, busy: 0, queued: 0, maxQueue: 0 },
           layers: {
             stringReplacements: config.replacements.length,
             toolNameRenames: config.toolRenames.length,
@@ -1423,10 +783,9 @@ function startServer(config) {
     requestCount++;
     const reqNum = requestCount;
     const chunks = [];
-    const requestStartedAt = nowMs();
 
     req.on('data', c => chunks.push(c));
-    req.on('end', async () => {
+    req.on('end', () => {
       let body = Buffer.concat(chunks);
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
@@ -1437,20 +796,7 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      const requestMeta = extractRequestMetadata(bodyStr, req.headers, config.bodyPreviewChars);
-      const requestModel = requestMeta.model;
-      const sizeLevel = requestSizeLevel(originalSize);
-      if (sizeLevel) {
-        console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} [SIZE-${sizeLevel}] request body ${originalSize}b model=${requestModel}; large bodies can stall transforms or signal weak compaction`);
-      }
-      try {
-        bodyStr = await runProcessBody(bodyStr, config, transformPool, reqNum);
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        appendUsageLog(config, { ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'processBody_error', durationMs: nowMs() - requestStartedAt, originalBytes: originalSize, model: requestModel, error: e.message, request: requestMeta });
-        res.end(JSON.stringify({ type: 'error', error: { message: 'processBody failed: ' + e.message } }));
-        return;
-      }
+      bodyStr = processBody(bodyStr, config);
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -1478,14 +824,7 @@ function startServer(config) {
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} model=${requestModel} (${originalSize}b -> ${body.length}b)`);
-      if (config.bodyPreviewChars && (requestMeta.firstUserPreview || requestMeta.lastUserPreview)) {
-        console.log(`[${ts}] #${reqNum} body-preview first=${JSON.stringify(requestMeta.firstUserPreview)} last=${JSON.stringify(requestMeta.lastUserPreview)}`);
-      }
-      appendUsageLog(config, {
-        ts: new Date().toISOString(), reqNum, method: req.method, url: req.url, event: 'request',
-        model: requestModel, originalBytes: originalSize, transformedBytes: body.length, sizeLevel, request: requestMeta
-      });
+      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
       let completed = false;
 
@@ -1506,81 +845,48 @@ function startServer(config) {
           const status = upRes.statusCode;
           const attemptSuffix = attempt > 1 ? ` attempt=${attempt}/${MAX_UPSTREAM_ATTEMPTS}` : '';
           console.log(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} > ${status}${attemptSuffix}`);
-          appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_headers', status, attempt, durationMs: nowMs() - requestStartedAt });
           if (status !== 200 && status !== 201) {
             const errChunks = [];
             upRes.on('data', c => errChunks.push(c));
             upRes.on('end', () => {
-              (async () => {
-                if (completed) return;
-                let errBody = Buffer.concat(errChunks).toString();
-                const detection = errBody.includes('extra usage');
-                if (detection) {
-                  console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} DETECTION! Body: ${body.length}b`);
-                }
-                appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_error_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(errBody), detection });
-                errBody = await runReverseMap(errBody, config, transformPool, reqNum);
-                const nh = { ...upRes.headers };
-                nh['content-length'] = Buffer.byteLength(errBody);
-                completed = true;
-                res.writeHead(status, nh);
-                res.end(errBody);
-              })().catch(e => fail(502, e.message));
+              if (completed) return;
+              let errBody = Buffer.concat(errChunks).toString();
+              if (errBody.includes('extra usage')) {
+                console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              }
+              errBody = reverseMap(errBody, config);
+              const nh = { ...upRes.headers };
+              nh['content-length'] = Buffer.byteLength(errBody);
+              completed = true;
+              res.writeHead(status, nh);
+              res.end(errBody);
             });
-            upRes.on('error', e => {
-              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_response_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
-              fail(502, e.message);
-            });
+            upRes.on('error', e => fail(502, e.message));
             return;
           }
           if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-            const streamChunks = [];
-            upRes.on('data', c => streamChunks.push(c));
-            upRes.on('end', () => {
-              try {
-                if (completed) return;
-                let streamBody = Buffer.concat(streamChunks).toString();
-                streamBody = transformSseResponse(streamBody, config);
-                const nh = { ...upRes.headers };
-                delete nh['transfer-encoding'];
-                nh['content-length'] = Buffer.byteLength(streamBody);
-                appendUsageLog(config, {
-                  ts: new Date().toISOString(), reqNum, event: 'stream_end',
-                  status, attempt, durationMs: nowMs() - requestStartedAt,
-                  responseBytes: Buffer.byteLength(streamBody), strictSseReverse: true
-                });
-                completed = true;
-                res.writeHead(status, nh);
-                res.end(streamBody);
-              } catch (e) {
-                fail(502, e.message);
-              }
-            });
+            completed = true;
+            res.writeHead(status, upRes.headers);
+            upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
+            upRes.on('end', () => res.end());
             upRes.on('error', e => {
               console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} STREAM ERR: ${e.message}`);
-              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'stream_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
-              fail(502, e.message);
+              if (!res.destroyed) res.end();
             });
           } else {
             const respChunks = [];
             upRes.on('data', c => respChunks.push(c));
             upRes.on('end', () => {
-              (async () => {
-                if (completed) return;
-                let respBody = Buffer.concat(respChunks).toString();
-                respBody = await runReverseMap(respBody, config, transformPool, reqNum);
-                const nh = { ...upRes.headers };
-                nh['content-length'] = Buffer.byteLength(respBody);
-                appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(respBody) });
-                completed = true;
-                res.writeHead(status, nh);
-                res.end(respBody);
-              })().catch(e => fail(502, e.message));
+              if (completed) return;
+              let respBody = Buffer.concat(respChunks).toString();
+              respBody = reverseMap(respBody, config);
+              const nh = { ...upRes.headers };
+              nh['content-length'] = Buffer.byteLength(respBody);
+              completed = true;
+              res.writeHead(status, nh);
+              res.end(respBody);
             });
-            upRes.on('error', e => {
-              appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_response_error', status, attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
-              fail(502, e.message);
-            });
+            upRes.on('error', e => fail(502, e.message));
           }
         });
         upstream.on('error', e => {
@@ -1589,12 +895,10 @@ function startServer(config) {
             const delay = upstreamRetryDelayMs(attempt);
             const code = e.code ? ` code=${e.code}` : '';
             console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} RETRY ${attempt + 1}/${MAX_UPSTREAM_ATTEMPTS} after ${e.message}${code} in ${delay}ms`);
-            appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'retry', attempt, nextAttempt: attempt + 1, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null, delayMs: delay });
             setTimeout(() => sendUpstream(attempt + 1), delay);
             return;
           }
           console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} ERR: ${e.message}`);
-          appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'upstream_error', attempt, durationMs: nowMs() - requestStartedAt, error: e.message, code: e.code || null });
           fail(502, e.message);
         });
         upstream.write(body);
@@ -1621,47 +925,21 @@ function startServer(config) {
       console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
-      console.log(`  Transform workers: ${transformPool ? transformPool.stats().workers : 'disabled'}`);
-      console.log(`  Max transform queue: ${transformPool ? transformPool.stats().maxQueue : 0}`);
       console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
-      console.log(`  Usage log:         ${config.usageLogEnabled ? config.usageLogPath : 'disabled'}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
   });
 
-  const shutdown = () => {
-    if (transformPool) transformPool.close();
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-}
-
-// ─── Worker Entrypoint ──────────────────────────────────────────────────────
-if (!isMainThread && workerData?.mode === 'transform-worker') {
-  parentPort.on('message', async msg => {
-    try {
-      let result;
-      if (msg.type === 'processBody') {
-        result = await processBody(msg.payload.bodyStr, msg.payload.config);
-      } else if (msg.type === 'reverseMap') {
-        result = reverseMap(msg.payload.text, msg.payload.config);
-      } else {
-        throw new Error(`unknown transform task: ${msg.type}`);
-      }
-      parentPort.postMessage({ id: msg.id, ok: true, result });
-    } catch (e) {
-      parentPort.postMessage({ id: msg.id, ok: false, error: e.message || String(e) });
-    }
-  });
+  process.on('SIGINT', () => process.exit(0));
+  process.on('SIGTERM', () => process.exit(0));
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
-if (require.main === module && isMainThread) {
+if (require.main === module) {
   const config = loadConfig();
   startServer(config);
 }
@@ -1670,10 +948,6 @@ module.exports = {
   loadConfig,
   processBody,
   reverseMap,
-  transformSseResponse,
-  createTransformPool,
-  runProcessBody,
-  runReverseMap,
   buildBillingBlock,
   computeBillingFingerprint,
   extractFirstUserText

@@ -1,0 +1,106 @@
+{
+  "port": 18801,
+  "credentialsPath": "/Users/chris/.claude/.credentials.json",
+  "replacements": [
+    [
+      "OpenClaw",
+      "OCPlatform"
+    ],
+    [
+      "openclaw",
+      "ocplatform"
+    ],
+    [
+      "HEARTBEAT_OK",
+      "HB_ACK"
+    ],
+    [
+      "running inside",
+      "running on"
+    ],
+    [
+      "sessions_spawn",
+      "create_task"
+    ],
+    [
+      "sessions_list",
+      "list_tasks"
+    ],
+    [
+      "sessions_history",
+      "get_history"
+    ],
+    [
+      "sessions_send",
+      "send_to_task"
+    ],
+    [
+      "sessions_yield_interrupt",
+      "task_yield_interrupt"
+    ],
+    [
+      "sessions_yield",
+      "yield_task"
+    ],
+    [
+      "sessions_store",
+      "task_store"
+    ]
+  ],
+  "reverseMap": [
+    [
+      "OCPlatform",
+      "OpenClaw"
+    ],
+    [
+      "ocplatform",
+      "openclaw"
+    ],
+    [
+      "HB_ACK",
+      "HEARTBEAT_OK"
+    ],
+    [
+      "create_task",
+      "sessions_spawn"
+    ],
+    [
+      "list_tasks",
+      "sessions_list"
+    ],
+    [
+      "get_history",
+      "sessions_history"
+    ],
+    [
+      "send_to_task",
+      "sessions_send"
+    ],
+    [
+      "task_yield_interrupt",
+      "sessions_yield_interrupt"
+    ],
+    [
+      "yield_task",
+      "sessions_yield"
+    ],
+    [
+      "task_store",
+      "sessions_store"
+    ],
+    [
+      "mcp_write_file",
+      "write"
+    ],
+    [
+      "mcp_read_file",
+      "read"
+    ],
+    [
+      "mcp_edit_file",
+      "edit"
+    ]
+  ],
+  "transformWorkers": 4,
+  "maxTransformQueue": 64
+}
