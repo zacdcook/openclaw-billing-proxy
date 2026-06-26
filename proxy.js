@@ -1011,6 +1011,20 @@ function reverseMap(text, config) {
   return r;
 }
 
+function reverseJsonStringValue(text, config) {
+  let r = text;
+  for (const [orig, cc] of config.toolRenames) {
+    if (r === cc) return orig;
+  }
+  for (const [orig, renamed] of config.propRenames) {
+    if (r === renamed) return orig;
+  }
+  for (const [sanitized, original] of config.reverseMap) {
+    r = r.split(sanitized).join(original);
+  }
+  return r;
+}
+
 // Strict SSE reverse mapping buffers a full streamed response and rewrites
 // logical Anthropic delta streams before forwarding them. This catches cases
 // where a sanitized token is split across separate text_delta or partial_json
@@ -1035,7 +1049,7 @@ function setPathValue(obj, pathParts, value) {
 }
 
 function reverseJsonStrings(value, config, skipPaths, currentPath = []) {
-  if (typeof value === 'string') return reverseMap(value, config);
+  if (typeof value === 'string') return reverseJsonStringValue(value, config);
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
       const childPath = currentPath.concat(i);
