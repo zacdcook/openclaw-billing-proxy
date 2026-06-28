@@ -2,7 +2,7 @@
 /**
  * OpenClaw Subscription Billing Proxy v2.0
  *
- * Routes Hermes (proxy4) API requests through Claude Code's subscription billing
+ * Routes OpenClaw API requests through Claude Code's subscription billing
  * instead of Extra Usage. Defeats Anthropic's multi-layer detection:
  *
  *   Layer 1: Billing header injection (84-char Claude Code identifier)
@@ -32,7 +32,7 @@ const crypto = require('crypto');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
-const DEFAULT_PORT = 18804;
+const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.1.0';
 const DEFAULT_TRANSFORM_WORKERS = Math.max(2, Math.min(4, os.cpus()?.length || 2));
@@ -72,11 +72,8 @@ const CC_TOOL_STUBS = [
   '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
   '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
   '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
-  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}'
-  // NOTE: 'TodoRead' decoy stub removed 2026-06-27. The model was actually
-  // calling it mid-task, producing "Model generated invalid tool call: TodoRead"
-  // because no real tool / reverse-mapping backs it. Fingerprint bypass still
-  // holds via the remaining stubs + the tool-name rename layer.
+  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
+  '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
@@ -167,16 +164,6 @@ function getStainlessHeaders() {
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
-  // NOTE: removed bare ['Hermes','Hank'] / ['hermes','Hank'] renames — they
-  // rewrote real filesystem paths like ~/.hermes -> ~/.Hank, breaking commands.
-  // The Hermes branding is already removed by the Layer-4 template strip; the
-  // bare word 'Hermes' in user text is just a name, not a fingerprint.
-  ['claude-code.nousresearch.com', 'docs.anthropic.com/claude-code'],
-  ['nousresearch.com', 'anthropic.com'],
-  ['nousresearch', 'anthropic'],
-  ['cua-driver', 'computer-use-driver'],
-  ['tirith', 'cli-runtime'],
-  ['Active Hermes profile', 'Active session profile'],
   ['OCPlatform', 'OCRoute'],
   ['ocplatform', 'ocroute'],
   ['OpenClaw', 'OCPlatform'],
@@ -230,36 +217,6 @@ const DEFAULT_REPLACEMENTS = [
 //
 // ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
 const DEFAULT_TOOL_RENAMES = [
-  // === Real Hermes mcp__ tools (captured live 2026-06-26) — DOUBLE underscore ===
-  ['mcp__browser_back', 'BrowserBack'],
-  ['mcp__browser_click', 'BrowserClick'],
-  ['mcp__browser_console', 'BrowserConsole'],
-  ['mcp__browser_get_images', 'BrowserImages'],
-  ['mcp__browser_navigate', 'BrowserNavigate'],
-  ['mcp__browser_press', 'BrowserPress'],
-  ['mcp__browser_scroll', 'BrowserScroll'],
-  ['mcp__browser_snapshot', 'BrowserSnapshot'],
-  ['mcp__browser_type', 'BrowserType'],
-  ['mcp__browser_vision', 'BrowserVision'],
-  ['mcp__clarify', 'AskUser'],
-  ['mcp__computer_use', 'ComputerUse'],
-  ['mcp__cronjob', 'Scheduler'],
-  ['mcp__delegate_task', 'Task'],
-  ['mcp__execute_code', 'CodeExec'],
-  ['mcp__memory', 'MemoryStore'],
-  ['mcp__patch', 'Edit'],
-  ['mcp__process', 'BashSessionCtl'],
-  ['mcp__read_file', 'Read'],
-  ['mcp__search_files', 'SearchFiles'],
-  ['mcp__session_search', 'TaskSearch'],
-  ['mcp__skill_manage', 'SkillManage'],
-  ['mcp__skill_view', 'SkillView'],
-  ['mcp__skills_list', 'SkillList'],
-  ['mcp__terminal', 'Bash'],
-  ['mcp__text_to_speech', 'Speech'],
-  ['mcp__todo', 'TodoWrite'],
-  ['mcp__vision_analyze', 'VisionAnalyze'],
-  ['mcp__write_file', 'Write'],
   ['exec', 'Bash'],
   ['process', 'BashSession'],
   ['browser', 'BrowserControl'],
@@ -312,7 +269,7 @@ const DEFAULT_TOOL_RENAMES = [
   ['mcp_memory', 'MemoryStore'],
   ['mcp_patch', 'PatchApply'],
   ['mcp_process', 'BashSessionCtl'],
-  ['mcp_read_file', 'Read'],
+  ['mcp_read_file', 'FileRead'],
   ['mcp_search_files', 'GrepFiles'],
   ['mcp_session_search', 'TaskSearch'],
   ['mcp_skill_manage', 'SkillManage'],
@@ -322,7 +279,7 @@ const DEFAULT_TOOL_RENAMES = [
   ['mcp_text_to_speech', 'Speech'],
   ['mcp_todo', 'TodoWrite'],
   ['mcp_vision_analyze', 'VisionAnalyze'],
-  ['mcp_write_file', 'Write']
+  ['mcp_write_file', 'FileWrite']
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -403,8 +360,8 @@ function loadConfig() {
     port: port || config.port || DEFAULT_PORT,
     credsPath,
     replacements: dedupePairs([...DEFAULT_REPLACEMENTS, ...(config.replacements || [])]),
-    toolRenames: dedupePairs([...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])]),
     reverseMap: dedupePairs([...DEFAULT_REVERSE_MAP, ...(config.reverseMap || [])]),
+    toolRenames: dedupePairs([...DEFAULT_TOOL_RENAMES, ...(config.toolRenames || [])]),
     propRenames: dedupePairs([...DEFAULT_PROP_RENAMES, ...(config.propRenames || [])]),
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
@@ -865,9 +822,7 @@ async function processBody(bodyStr, config) {
   if (config.stripSystemConfig) {
     const HERMES_SOUL_MARKERS = [
       '# SOUL.md - Who You Are',
-      'You run on Claude Code (by Anthropic)',
-      'You communicate clearly, admit uncertainty',
-      'You have persistent memory across sessions'
+      '# CLAUDE.md - Who You Are'
     ];
     const HERMES_SKILLS_MARKERS = [
       '<available_skills>',
@@ -875,9 +830,7 @@ async function processBody(bodyStr, config) {
     ];
     const HERMES_END_MARKERS = [
       'Conversation started:',
-      'You are a CLI AI Agent.',
-      'Host: macOS',
-      'Current Session Context'
+      'You are a CLI AI Agent.'
     ];
 
     let soulStart = -1;
@@ -948,34 +901,6 @@ async function processBody(bodyStr, config) {
     if (toolsIdx !== -1) {
       const insertAt = toolsIdx + '"tools":['.length;
       m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
-    }
-  }
-
-  // Safety net: ensure tool names are unique (Anthropic 400s on duplicates).
-  // Stub injection + Hermes renames can collide; drop later duplicates by name.
-  if (config.injectCCStubs || (config.toolRenames && config.toolRenames.length)) {
-    const tIdx = m.indexOf('"tools":[');
-    if (tIdx !== -1) {
-      const tEnd = findMatchingBracket(m, tIdx + '"tools":'.length);
-      if (tEnd !== -1) {
-        try {
-          const arr = JSON.parse(m.slice(tIdx + '"tools":'.length, tEnd + 1));
-          if (Array.isArray(arr)) {
-            const seen = new Set();
-            const uniq = [];
-            for (const t of arr) {
-              const nm = t && t.name;
-              if (nm && seen.has(nm)) continue;
-              if (nm) seen.add(nm);
-              uniq.push(t);
-            }
-            if (uniq.length !== arr.length) {
-              console.log(`[DEDUP] removed ${arr.length - uniq.length} duplicate tool name(s)`);
-              m = m.slice(0, tIdx) + '"tools":' + JSON.stringify(uniq) + m.slice(tEnd + 1);
-            }
-          }
-        } catch (e) { /* if parse fails, leave tools untouched */ }
-      }
     }
   }
 
@@ -1069,22 +994,6 @@ async function processBody(bodyStr, config) {
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
-// Strip HTTP framing/encoding headers from an upstream header set before we
-// re-send a rewritten body with our own content-length. If we leave
-// transfer-encoding (chunked) OR content-encoding (gzip) in place while also
-// setting content-length, the client sees conflicting framing (RFC 7230 3.3.2)
-// and truncates the body -> "unexpected end of data". This was the root cause
-// of intermittent HTTP 400 invalid-JSON truncation errors (2026-06-27).
-function stripFramingHeaders(h) {
-  for (const k of Object.keys(h)) {
-    const lk = k.toLowerCase();
-    if (lk === 'transfer-encoding' || lk === 'content-encoding' || lk === 'content-length') {
-      delete h[k];
-    }
-  }
-  return h;
-}
-
 function reverseMap(text, config) {
   let r = text;
   // Reverse tool names first (more specific patterns)
@@ -1099,10 +1008,10 @@ function reverseMap(text, config) {
   for (const [sanitized, original] of config.reverseMap) {
     r = r.split(sanitized).join(original);
   }
-  return canonicalizePathAliases(r);
+  return canonicalizeWorkspacePaths(r);
 }
 
-function canonicalizePathAliases(text) {
+function canonicalizeWorkspacePaths(text) {
   const homeDir = os.homedir();
   return text
     .split(`${homeDir}/.ocplatform`).join(`${homeDir}/.openclaw`)
@@ -1128,7 +1037,7 @@ function reverseJsonStringValue(text, config) {
   for (const [sanitized, original] of config.reverseMap) {
     r = r.split(sanitized).join(original);
   }
-  return canonicalizePathAliases(r);
+  return canonicalizeWorkspacePaths(r);
 }
 
 // Strict SSE reverse mapping buffers a full streamed response and rewrites
@@ -1536,10 +1445,6 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      // --- one-shot capture hook (env-gated) ---
-      if (process.env.CAPTURE_BODY && bodyStr.length > 5000) {
-        try { require('fs').writeFileSync(process.env.CAPTURE_BODY, bodyStr); console.log('[CAPTURE] wrote', bodyStr.length, 'bytes ->', process.env.CAPTURE_BODY); } catch(e){}
-      }
       const requestMeta = extractRequestMetadata(bodyStr, req.headers, config.bodyPreviewChars);
       const requestModel = requestMeta.model;
       const sizeLevel = requestSizeLevel(originalSize);
@@ -1623,7 +1528,7 @@ function startServer(config) {
                 }
                 appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_error_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(errBody), detection });
                 errBody = await runReverseMap(errBody, config, transformPool, reqNum);
-                const nh = stripFramingHeaders({ ...upRes.headers });
+                const nh = { ...upRes.headers };
                 nh['content-length'] = Buffer.byteLength(errBody);
                 completed = true;
                 res.writeHead(status, nh);
@@ -1644,7 +1549,8 @@ function startServer(config) {
                 if (completed) return;
                 let streamBody = Buffer.concat(streamChunks).toString();
                 streamBody = transformSseResponse(streamBody, config);
-                const nh = stripFramingHeaders({ ...upRes.headers });
+                const nh = { ...upRes.headers };
+                delete nh['transfer-encoding'];
                 nh['content-length'] = Buffer.byteLength(streamBody);
                 appendUsageLog(config, {
                   ts: new Date().toISOString(), reqNum, event: 'stream_end',
@@ -1671,7 +1577,7 @@ function startServer(config) {
                 if (completed) return;
                 let respBody = Buffer.concat(respChunks).toString();
                 respBody = await runReverseMap(respBody, config, transformPool, reqNum);
-                const nh = stripFramingHeaders({ ...upRes.headers });
+                const nh = { ...upRes.headers };
                 nh['content-length'] = Buffer.byteLength(respBody);
                 appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(respBody) });
                 completed = true;
