@@ -887,10 +887,29 @@ async function processBody(bodyStr, config) {
     }
     const hasSkillsBlock = HERMES_SKILLS_MARKERS.some(marker => m.indexOf(marker, soulStart) !== -1);
     if (soulStart !== -1 && hasSkillsBlock) {
+      // JSON-SAFETY: the strip must never cross a JSON string boundary. soulStart
+      // sits inside a single JSON string value (the system prompt). Find the end
+      // of THAT string (first unescaped double-quote after soulStart) and never
+      // let the boundary run past it. Without this cap, a compacted body whose
+      // nearest END marker lives in a later message/tool_result gets its closing
+      // quote + structural JSON eaten, producing an invalid body Anthropic 400s on
+      // ("unexpected end of data"). See regression test hermes_strip_json_safety.
+      let stringEnd = -1;
+      for (let i = soulStart; i < m.length; i++) {
+        if (m[i] === '\\') { i++; continue; } // skip escaped char (incl. \" and \\)
+        if (m[i] === '"') { stringEnd = i; break; }
+      }
+
       let boundary = -1;
       for (const marker of HERMES_END_MARKERS) {
         const idx = m.indexOf(marker, soulStart);
         if (idx !== -1 && (boundary === -1 || idx < boundary)) boundary = idx;
+      }
+      // Clamp the boundary to the end of the current JSON string. If the nearest
+      // END marker is outside this string (or none was found), fall back to the
+      // string end so we only ever delete text within the system value.
+      if (stringEnd !== -1 && (boundary === -1 || boundary > stringEnd)) {
+        boundary = stringEnd;
       }
 
       if (boundary !== -1) {
@@ -906,8 +925,18 @@ async function processBody(bodyStr, config) {
             'briefly before tool use, preserve user preferences, and consult available skills when the ' +
             'task clearly matches them.\\n';
 
-          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
-          console.log(`[STRIP] Removed ${strippedLen} chars of Hermes template`);
+          const candidate = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
+          // Final guard: only accept the strip if the body is still parseable.
+          // If some edge case still broke structure, revert and leave the body
+          // intact rather than shipping a 400-guaranteed request upstream.
+          let safe = true;
+          try { JSON.parse(candidate); } catch (_) { safe = false; }
+          if (safe) {
+            m = candidate;
+            console.log(`[STRIP] Removed ${strippedLen} chars of Hermes template`);
+          } else {
+            console.log(`[STRIP] Skipped Hermes strip (${strippedLen} chars) — would have broken JSON`);
+          }
         }
       }
     }
