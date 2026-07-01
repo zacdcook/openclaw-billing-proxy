@@ -1651,6 +1651,22 @@ function startServer(config) {
                   console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} DETECTION! Body: ${body.length}b`);
                 }
                 appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'response_error_body', status, attempt, durationMs: nowMs() - requestStartedAt, responseBytes: Buffer.byteLength(errBody), detection });
+                // Detection-aware retry (2026-06-30): Anthropic's third-party-app
+                // detection is probabilistic — a request flagged with an HTTP
+                // 400 "extra usage" body almost always succeeds on an immediate
+                // resend (observed: #502 detected, #503 identical → 200). Rather
+                // than relay the 400 (which surfaces as a "Session reset" + error
+                // banner to the client), transparently re-send upstream with
+                // backoff. Only detection-400s retry; every other non-2xx
+                // response passes through untouched so genuine errors aren't
+                // masked. If all attempts get detected, relay the last 400.
+                if (detection && status === 400 && attempt < MAX_UPSTREAM_ATTEMPTS && !res.headersSent && !completed) {
+                  const delay = upstreamRetryDelayMs(attempt);
+                  console.error(`[${new Date().toISOString().substring(11, 19)}] #${reqNum} DETECTION-RETRY ${attempt + 1}/${MAX_UPSTREAM_ATTEMPTS} in ${delay}ms`);
+                  appendUsageLog(config, { ts: new Date().toISOString(), reqNum, event: 'detection_retry', attempt, nextAttempt: attempt + 1, durationMs: nowMs() - requestStartedAt, delayMs: delay });
+                  setTimeout(() => sendUpstream(attempt + 1), delay);
+                  return;
+                }
                 errBody = await runReverseMap(errBody, config, transformPool, reqNum);
                 const nh = stripFramingHeaders({ ...upRes.headers });
                 nh['content-length'] = Buffer.byteLength(errBody);
