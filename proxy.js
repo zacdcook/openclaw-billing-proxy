@@ -37,7 +37,12 @@ const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.2.3';
 
 // Claude Code version to emulate (update when new CC versions are released)
-const CC_VERSION = '2.1.97';
+const CC_VERSION = '2.1.205';
+
+// Last upstream request-id, used to emit the modern `cc_prev_req` billing-header
+// chain field that real CC 2.1.205 sends on first-party requests. Genuine sessions
+// chain consecutive requests; a static header that never chains is a detection tell.
+let LAST_REQUEST_ID = null;
 
 // Billing fingerprint constants (matches real CC utils/fingerprint.ts)
 const BILLING_HASH_SALT = '59cf53e54c78';
@@ -46,17 +51,31 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 // Persistent per-instance identifiers (generated once at startup)
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
+// Real account UUID for this OAuth identity (genuine CC includes it in
+// metadata.user_id; its absence is a detection tell). Kept out of source:
+// set via CC_ACCOUNT_UUID env or `account_uuid` in the gitignored config.json.
+let ACCOUNT_UUID = process.env.CC_ACCOUNT_UUID || '';
+try {
+  if (!ACCOUNT_UUID) {
+    ACCOUNT_UUID = (JSON.parse(require('fs').readFileSync(require('path').join(__dirname, 'config.json'), 'utf8')).account_uuid) || '';
+  }
+} catch (e) {}
 
-// Beta flags required for OAuth + Claude Code features
+// Beta flags — EXACT list + order captured from genuine Claude Code 2.1.205
+// (via capture proxy, 2026-07-16). Must match verbatim; the set/order is a
+// fingerprint. Genuine CC replaces the beta header wholesale, so we override.
 const REQUIRED_BETAS = [
-  'oauth-2025-04-20',
   'claude-code-20250219',
+  'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
-  'advanced-tool-use-2025-11-20',
+  'thinking-token-count-2026-05-13',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
+  'mid-conversation-system-2026-04-07',
+  'advisor-tool-2026-03-01',
+  'advanced-tool-use-2025-11-20',
   'effort-2025-11-24',
-  'fast-mode-2026-02-01'
+  'extended-cache-ttl-2025-04-11'
 ];
 
 // CC tool stubs -- injected into tools array to make the tool set look more
@@ -127,25 +146,33 @@ function buildBillingBlock(bodyStr) {
   const firstText = extractFirstUserText(bodyStr);
   const fingerprint = computeBillingFingerprint(firstText);
   const ccVersion = `${CC_VERSION}.${fingerprint}`;
-  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+  // Modern CC (2.1.205) assembles: cc_version=..; cc_entrypoint=..; cch=00000; [ cc_prev_req=<id>;]
+  // The prev-request chain is only present once there is a prior request (first-party).
+  const prev = LAST_REQUEST_ID ? ` cc_prev_req=${LAST_REQUEST_ID};` : '';
+  // Genuine 2.1.205 (sdk-cli mode, captured 2026-07-16) emits exactly:
+  //   "x-anthropic-billing-header: cc_version=<v.fp>; cc_entrypoint=sdk-cli;"
+  // No cch field in this mode. Entrypoint must match the user-agent's (sdk-cli).
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=sdk-cli;${prev}"}`;
 }
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
 // Real Claude Code sends these on every request via the Anthropic JS SDK.
 function getStainlessHeaders() {
   const p = process.platform;
-  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  // Genuine CC reports 'MacOS' (capital OS), not Node's 'macOS' — casing is a tell.
+  const osName = p === 'darwin' ? 'MacOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  // All values below captured verbatim from genuine CC 2.1.205 (sdk-cli, 2026-07-16).
   return {
-    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'user-agent': `claude-cli/${CC_VERSION} (external, sdk-cli)`,
     'x-app': 'cli',
     'x-claude-code-session-id': INSTANCE_SESSION_ID,
     'x-stainless-arch': arch,
     'x-stainless-lang': 'js',
     'x-stainless-os': osName,
-    'x-stainless-package-version': '0.81.0',
+    'x-stainless-package-version': '0.94.0',
     'x-stainless-runtime': 'node',
-    'x-stainless-runtime-version': process.version,
+    'x-stainless-runtime-version': 'v26.3.0',
     'x-stainless-retry-count': '0',
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true'
@@ -649,7 +676,8 @@ function processBody(bodyStr, config) {
 
   // Metadata injection: device_id + session_id matching real CC format
   // Uses raw string manipulation to inject/replace metadata field
-  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+  // Genuine metadata.user_id includes account_uuid between device_id and session_id.
+  const metaValue = JSON.stringify({ device_id: DEVICE_ID, account_uuid: ACCOUNT_UUID, session_id: INSTANCE_SESSION_ID });
   const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
   const existingMeta = m.indexOf('"metadata":{');
   if (existingMeta !== -1) {
@@ -811,20 +839,28 @@ function startServer(config) {
         headers[k] = v;
       }
 
-      const existingBeta = headers['anthropic-beta'] || '';
-      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
-      headers['anthropic-beta'] = betas.join(',');
+      // Override wholesale with the genuine list/order — a merged set that keeps
+      // OpenClaw-specific betas (or reorders) is itself a fingerprint.
+      headers['anthropic-beta'] = REQUIRED_BETAS.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
+      // Genuine CC posts to /v1/messages?beta=true — ensure the query param is present.
+      let upstreamPath = req.url;
+      if (upstreamPath.startsWith('/v1/messages') && !/[?&]beta=true/.test(upstreamPath)) {
+        upstreamPath += (upstreamPath.includes('?') ? '&' : '?') + 'beta=true';
+      }
+
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
+        path: upstreamPath, method: req.method, headers
       }, (upRes) => {
         const status = upRes.statusCode;
         console.log(`[${ts}] #${reqNum} > ${status}`);
+        // Track upstream request-id to chain the next request's cc_prev_req header.
+        const rid = upRes.headers['request-id'] || upRes.headers['anthropic-request-id'];
+        if (rid) LAST_REQUEST_ID = rid;
         if (status !== 200 && status !== 201) {
           const errChunks = [];
           upRes.on('data', c => errChunks.push(c));
