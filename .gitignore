@@ -2,3 +2,8 @@ config.json
 node_modules/
 *.log
 hermes_proxy.js.bak.*
+
+# Local safety backups (kept out of git)
+proxy.js.bak-*
+proxy.js.local-*
+proxy.js.upstream-untouched-*
