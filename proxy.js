@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.3';
+const VERSION = '2.2.5';
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -410,6 +410,9 @@ function loadConfig() {
     reverseMap,
     toolRenames,
     propRenames,
+    // Derived once: the search set the SSE reverse pass uses to decide how much
+    // of a partially-arrived delta is safe to emit. See safeSplitPoint().
+    reverseNeedles: buildReverseNeedles(toolRenames, propRenames, reverseMap),
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
@@ -738,6 +741,71 @@ function reverseMap(text, config) {
   return r;
 }
 
+// ─── Streaming Split Protection ─────────────────────────────────────────────
+// Upstream chunks assistant text and tool arguments arbitrarily across SSE
+// events, so a sanitized token routinely arrives cut in half:
+//   data: {...,"delta":{"type":"text_delta","text":"...OCPlat"}}
+//   data: {...,"delta":{"type":"text_delta","text":"form runs the"}}
+// reverseMap() on one event in isolation can never revert those halves: the
+// client sees "OCPlatform" leak through, and a split tool/property name inside
+// input_json_delta reaches OpenClaw's runtime unmapped ("message required").
+// Fix: accumulate the decoded delta payload per content block and release only
+// the part that cannot take part in a match continuing into the next event.
+//
+// buildReverseNeedles collects every string the reverse pass searches for, so
+// the per-delta safety check is a couple of Set lookups.
+function buildReverseNeedles(toolRenames, propRenames, reverseMapPairs) {
+  const needles = [];
+  // Both quoted forms, matching reverseMap(): SSE input_json_delta carries tool
+  // args as an escaped JSON string, so \"Name\" occurs as well as "Name".
+  for (const [, cc] of toolRenames) needles.push('"' + cc + '"', '\\"' + cc + '\\"');
+  for (const [, renamed] of propRenames) needles.push('"' + renamed + '"', '\\"' + renamed + '\\"');
+  for (const [sanitized] of reverseMapPairs) if (sanitized) needles.push(sanitized);
+  const prefixes = new Set();
+  let maxLen = 0;
+  for (const n of needles) {
+    if (n.length > maxLen) maxLen = n.length;
+    for (let k = 1; k < n.length; k++) prefixes.add(n.slice(0, k));
+  }
+  return { needles, prefixes, maxLen };
+}
+
+// How many leading chars of `buf` are safe to reverse-map and emit right now.
+// Guarantees: (1) the split never lands inside a complete needle occurrence,
+// and (2) the released text never ends with a fragment that could still grow
+// into a needle once the next delta arrives. Returns buf.length — no hold-back
+// at all — whenever the tail can't start a match, which is the common case, so
+// streaming stays byte-for-byte as responsive as before.
+function safeSplitPoint(buf, nx) {
+  const N = buf.length;
+  if (N === 0 || nx.maxLen < 2) return N;
+  let keep = 0;
+  // Ascending i => longest candidate suffix first.
+  for (let i = Math.max(0, N - (nx.maxLen - 1)); i < N; i++) {
+    if (nx.prefixes.has(buf.slice(i))) { keep = N - i; break; }
+  }
+  if (keep === 0) return N;
+  let s = N - keep;
+  // The held fragment can sit inside a longer complete match (needle "skillhub"
+  // held because it also starts "skillhub.example.com", while "clawhub" already
+  // matched across it). Walk the split left out of anything it would bisect.
+  for (let guard = 0; guard < 8 && s > 0; guard++) {
+    const winStart = Math.max(0, s - nx.maxLen);
+    const win = buf.slice(winStart, N);
+    let moved = false;
+    for (const n of nx.needles) {
+      let idx = win.indexOf(n);
+      while (idx !== -1 && winStart + idx < s) {
+        if (winStart + idx + n.length > s) { s = winStart + idx; moved = true; break; }
+        idx = win.indexOf(n, idx + 1);
+      }
+      if (moved) break;
+    }
+    if (!moved) break;
+  }
+  return s;
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -857,11 +925,37 @@ function startServer(config) {
           delete sseHeaders['transfer-encoding'];   // avoid header conflicts
           res.writeHead(status, sseHeaders);
           // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
+          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks
           // so multi-byte chars (中文, emoji) that land on a chunk boundary
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
           let currentBlockIsThinking = false;
+          // Per-content-block hold-back: delta bytes whose reverse mapping
+          // can't be decided until the next delta arrives. See "Streaming
+          // Split Protection" above.
+          let carry = '';        // raw, not yet reverse-mapped
+          let carryKind = null;  // 'text_delta' | 'input_json_delta'
+          let carryIndex = 0;
+
+          const deltaEvent = (index, kind, payload) => {
+            const delta = kind === 'input_json_delta'
+              ? { type: 'input_json_delta', partial_json: payload }
+              : { type: 'text_delta', text: payload };
+            return 'event: content_block_delta\ndata: ' +
+              JSON.stringify({ type: 'content_block_delta', index, delta }) + '\n\n';
+          };
+
+          // Release whatever is still held for the current block. Re-chunking
+          // is invisible to the client: deltas concatenate, so splitting one
+          // event into two (or merging a held tail into the next) is legal SSE.
+          const flushCarry = () => {
+            if (carry === '') return '';
+            const out = deltaEvent(carryIndex, carryKind, reverseMap(carry, config));
+            carry = '';
+            carryKind = null;
+            return out;
+          };
 
           const transformEvent = (event) => {
             // Locate the data: line (always at the start of an SSE line)
@@ -874,23 +968,62 @@ function startServer(config) {
               : event.slice(dataIdx + 6, dataLineEnd);
 
             if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
+              const pre = flushCarry(); // defensive: previous block never stopped
               if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
                   dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
                 currentBlockIsThinking = true;
-                return event; // pass through unchanged
+                return pre + event; // pass through unchanged
               }
               currentBlockIsThinking = false;
-              return reverseMap(event, config);
+              return pre + reverseMap(event, config);
             }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
-            }
+
             if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
+              // thinking_delta / signature_delta and the block's own stop event:
+              // the client echoes these bytes verbatim on the next turn.
+              if (dataStr.indexOf('"type":"content_block_stop"') !== -1) currentBlockIsThinking = false;
               return event;
             }
+
+            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+              return flushCarry() + reverseMap(event, config);
+            }
+
+            if (dataStr.indexOf('"type":"content_block_delta"') !== -1) {
+              let evt = null;
+              try { evt = JSON.parse(dataStr); } catch (e) { evt = null; }
+              const d = evt && evt.delta;
+              const kind = d && d.type;
+              const piece = !d ? null
+                : kind === 'text_delta' ? d.text
+                : kind === 'input_json_delta' ? d.partial_json
+                : null;
+              if (typeof piece === 'string') {
+                // Decoded payload: the escaping is stripped, so patterns match
+                // the model's actual output rather than its JSON encoding.
+                let out = '';
+                if (carry !== '' && carryKind !== kind) out = flushCarry(); // block changed delta kind
+                carryKind = kind;
+                if (typeof evt.index === 'number') carryIndex = evt.index;
+                const buf = carry + piece;
+                const cut = safeSplitPoint(buf, config.reverseNeedles);
+                carry = buf.slice(cut);
+                if (cut > 0) out += deltaEvent(carryIndex, kind, reverseMap(buf.slice(0, cut), config));
+                return out;
+              }
+              // citations_delta / unrecognised shape: flush first so the held
+              // text still precedes it in the stream.
+              return flushCarry() + reverseMap(event, config);
+            }
+
+            if (dataStr.indexOf('"type":"message_delta"') !== -1 ||
+                dataStr.indexOf('"type":"message_stop"') !== -1 ||
+                dataStr.indexOf('"type":"error"') !== -1) {
+              return flushCarry() + reverseMap(event, config);
+            }
+
+            // ping and anything else: must NOT flush — pings arrive between
+            // deltas, and flushing there would defeat the hold-back.
             return reverseMap(event, config);
           };
 
@@ -900,7 +1033,8 @@ function startServer(config) {
             while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
               const event = pending.slice(0, sepIdx + 2);
               pending = pending.slice(sepIdx + 2);
-              res.write(transformEvent(event));
+              const out = transformEvent(event);
+              if (out) res.write(out);
             }
           });
           upRes.on('end', () => {
@@ -908,8 +1042,11 @@ function startServer(config) {
             if (pending.length > 0) {
               // Trailing bytes with no terminator — shouldn't happen in
               // well-formed SSE, but flush to avoid silent drops.
-              res.write(transformEvent(pending));
+              const out = transformEvent(pending);
+              if (out) res.write(out);
             }
+            const tail = flushCarry(); // stream ended mid-block
+            if (tail) res.write(tail);
             res.end();
           });
         } else {

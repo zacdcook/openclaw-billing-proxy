@@ -1,5 +1,36 @@
 # Changelog
 
+## v2.2.5 -- 2026-08-19
+
+### Fix reverse mapping of sanitized tokens split across SSE events
+
+**Changes:**
+- The SSE reverse pass now accumulates `text_delta` / `input_json_delta`
+  payloads per content block and releases only the bytes that cannot still be
+  part of a match continuing into the next event (`safeSplitPoint()`).
+- Reverse patterns are now matched against the *decoded* delta payload instead
+  of the raw JSON line, so escaping no longer has to be pattern-matched twice.
+- Held-back bytes are flushed at `content_block_stop`, `message_stop`, and on
+  stream end, so a truncated stream can't swallow them.
+
+**Why:**
+Per-event transformation assumed SSE events are self-contained. They are not:
+upstream splits assistant text and tool arguments at arbitrary offsets, so
+`OCPlatform` regularly arrives as `OCPlat` + `form` in two separate
+`content_block_delta` events. Neither half matched a reverse pattern, so
+sanitized tokens leaked to the client verbatim, and split tool/property names
+inside `input_json_delta` reached OpenClaw's tool runtime unmapped
+("message required"). Partial overlaps could also corrupt text outright --
+`skillhub` + `.example.com` reverted to `clawhub.example.com` instead of
+`clawhub.com`, because the shorter pattern matched the first half alone.
+
+Hold-back only happens when the tail of a delta is a prefix of some reverse
+pattern, so ordinary prose streams through with the same event boundaries and
+the same latency as before. thinking/redacted_thinking blocks still pass
+through byte-identical.
+
+---
+
 ## v2.2.4 -- 2026-04-09
 
 ### Fix config strip boundary using filesystem paths instead of AGENTS.md (closes #26)
