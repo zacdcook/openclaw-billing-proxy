@@ -1,5 +1,10 @@
 # OpenClaw Subscription Billing Proxy
 
+`openclaw-billing-proxy · fork of zacdcook/openclaw-billing-proxy · jediswimmer`
+
+> [!NOTE]
+> jediswimmer fork of [zacdcook/openclaw-billing-proxy](https://github.com/zacdcook/openclaw-billing-proxy). Default branch is `master`. This clone is behind upstream. Not a Titans Rift product. Follow upstream for install.
+
 Route your OpenClaw API requests through your Claude Max/Pro subscription instead of Extra Usage billing.
 
 ## What This Does
